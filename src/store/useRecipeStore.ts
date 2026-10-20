@@ -1,100 +1,135 @@
 import {create} from "zustand";
 import {toast} from "sonner";
-import {RecipeCreateDto, RecipeDto, ResolvedRecipeDto} from "@/types/recipe.types";
+import {Recipe, RecipeCreatePayload} from "@/types/recipe.types";
+import {readBackendError} from "@/lib/access/accessErrors";
 
+/**
+ * Процедурные рецепты ОТКРЫТОГО ПРОЕКТА в редакторе (черновик).
+ *
+ * Контракт `docs/contract/2026-10-19-recipes-in-project-contract.md`: рецепт принадлежит
+ * проекту, смотреть — `view`/`edit`, менять — `edit`. До мойки он доезжает только с новым
+ * prod-выпуском, поэтому монитор этот стор НЕ читает — у него свой список из runtime
+ * (`useMonitorRecipesStore`), ровно тот, что исполнит процедура.
+ */
 type RecipeState = {
-  recipes: RecipeDto[];
-  loadRecipes: (componentId: number) => Promise<void>;
-  createRecipe: (recipe: RecipeCreateDto) => Promise<boolean>;
-  updateRecipe: (id: number, recipe: RecipeCreateDto) => Promise<boolean>;
-  deleteRecipe: (id: number) => Promise<void>;
-  resolveRecipe: (id: number) => Promise<ResolvedRecipeDto | null>;
+  /** Проект, для которого загружен (или грузится) `recipes`; `null` — ещё ни для какого. */
+  projectId: number | null;
+  recipes: Recipe[];
+  /**
+   * Флаг живёт в сторе, а не в компоненте: иначе панель завела бы `setState` прямо
+   * в эффекте — в этом проекте так не делают (правило `react-hooks/set-state-in-effect`).
+   */
+  isLoading: boolean;
+  /**
+   * Причина последней неудачной загрузки, `null` — ошибки нет. Хранится отдельно от
+   * `projectId`: его сброс при ошибке заставил бы эффект панели тут же звать загрузку
+   * снова — бесконечный цикл запросов и тостов на 5xx и обрыве сети.
+   * Повтор — только явный, кнопкой «Повторить».
+   */
+  loadError: string | null;
+  loadRecipes: (projectId: number) => Promise<void>;
+  createRecipe: (payload: RecipeCreatePayload) => Promise<Recipe | null>;
+  updateRecipe: (id: string, payload: RecipeCreatePayload) => Promise<Recipe | null>;
+  deleteRecipe: (id: string) => Promise<void>;
 };
 
+const recipesUrl = (projectId: number) => `/api/editor/projects/${projectId}/recipes`;
+const recipeUrl = (projectId: number, id: string) =>
+  `${recipesUrl(projectId)}/${encodeURIComponent(id)}`;
+
+/**
+ * Текст ошибки бэкенда. У 400-х рецепта `message` содержательный — перечисляет необъявленные
+ * теги или несовпавший тип; 403 (`NO_PROJECT_ACCESS` / `NO_EDIT`) переводит `describeDenial`.
+ */
+const fail = async (res: Response): Promise<never> => {
+  throw new Error(await readBackendError(res));
+};
+
+const report = (err: unknown, fallback: string) => {
+  console.error(err);
+  toast.error(err instanceof Error ? err.message : fallback);
+};
+
+/** Ответ на запрос, отправленный для другого проекта, в стор не попадает. */
+let loadSeq = 0;
+
 export const useRecipeStore = create<RecipeState>((set, get) => ({
+  projectId: null,
   recipes: [],
-  loadRecipes: async (componentId) => {
+  isLoading: false,
+  loadError: null,
+
+  loadRecipes: async (projectId) => {
+    const seq = ++loadSeq;
+    // Список другого проекта не показываем ни мгновения: он похож на правду.
+    set({projectId, recipes: get().projectId === projectId ? get().recipes : [], isLoading: true, loadError: null});
     try {
-      const res = await fetch(`/api/editor/recipes?componentId=${componentId}`);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.error || "Ошибка загрузки рецептов");
-      }
-      const recipes: RecipeDto[] = await res.json();
-      set({recipes});
-    } catch (err: any) {
-      console.error(err);
-      toast.error(err.message || "Ошибка загрузки рецептов");
+      const res = await fetch(recipesUrl(projectId));
+      if (!res.ok) await fail(res);
+      const recipes: Recipe[] = await res.json();
+      if (seq === loadSeq) set({recipes});
+    } catch (err: unknown) {
+      if (seq !== loadSeq) return;
+      report(err, "Ошибка загрузки рецептов");
+      // `projectId` не сбрасываем — см. `loadError`.
+      set({recipes: [], loadError: err instanceof Error ? err.message : "Ошибка загрузки рецептов"});
+    } finally {
+      if (seq === loadSeq) set({isLoading: false});
     }
   },
-  createRecipe: async (recipe) => {
+
+  createRecipe: async (payload) => {
+    const projectId = get().projectId;
+    if (projectId == null) return null;
     try {
-      const res = await fetch("/api/editor/recipes", {
+      const res = await fetch(recipesUrl(projectId), {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(recipe),
+        body: JSON.stringify(payload),
       });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.error || "Ошибка создания рецепта");
-      }
-      const created: RecipeDto = await res.json();
-      set({recipes: [...get().recipes, created]});
+      if (!res.ok) await fail(res);
+
+      const created: Recipe = await res.json();
+      if (get().projectId === projectId) set({recipes: [...get().recipes, created]});
       toast.success("Рецепт создан");
-      return true;
-    } catch (err: any) {
-      console.error(err);
-      toast.error(err.message || "Ошибка создания рецепта");
-      return false;
+      return created;
+    } catch (err: unknown) {
+      report(err, "Ошибка создания рецепта");
+      return null;
     }
   },
-  updateRecipe: async (id, recipe) => {
+
+  updateRecipe: async (id, payload) => {
+    const projectId = get().projectId;
+    if (projectId == null) return null;
     try {
-      const res = await fetch(`/api/editor/recipes/${id}`, {
+      const res = await fetch(recipeUrl(projectId, id), {
         method: "PUT",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(recipe),
+        body: JSON.stringify(payload),
       });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.error || "Ошибка обновления рецепта");
-      }
-      const updated: RecipeDto = await res.json();
-      set({recipes: get().recipes.map(r => r.id === id ? updated : r)});
-      toast.success("Рецепт обновлён");
-      return true;
-    } catch (err: any) {
-      console.error(err);
-      toast.error(err.message || "Ошибка обновления рецепта");
-      return false;
-    }
-  },
-  deleteRecipe: async (id) => {
-    try {
-      const res = await fetch(`/api/editor/recipes/${id}`, {method: "DELETE"});
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.error || "Ошибка удаления рецепта");
-      }
-      set({recipes: get().recipes.filter(r => r.id !== id)});
-      toast.success("Рецепт удалён");
-    } catch (err: any) {
-      console.error(err);
-      toast.error(err.message || "Ошибка удаления рецепта");
-    }
-  },
-  resolveRecipe: async (id) => {
-    try {
-      const res = await fetch(`/api/editor/recipes/${id}/resolved`);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.error || "Ошибка получения набора значений");
-      }
-      return await res.json();
+      if (!res.ok) await fail(res);
+
+      const updated: Recipe = await res.json();
+      if (get().projectId === projectId) set({recipes: get().recipes.map(r => r.id === id ? updated : r)});
+      toast.success("Рецепт сохранён");
+      return updated;
     } catch (err: unknown) {
-      console.error(err);
-      toast.error(err instanceof Error ? err.message : "Ошибка получения набора значений");
+      report(err, "Ошибка сохранения рецепта");
       return null;
+    }
+  },
+
+  deleteRecipe: async (id) => {
+    const projectId = get().projectId;
+    if (projectId == null) return;
+    try {
+      const res = await fetch(recipeUrl(projectId, id), {method: "DELETE"});
+      if (!res.ok) await fail(res);
+      if (get().projectId === projectId) set({recipes: get().recipes.filter(r => r.id !== id)});
+      toast.success("Рецепт удалён");
+    } catch (err: unknown) {
+      report(err, "Ошибка удаления рецепта");
     }
   },
 }));

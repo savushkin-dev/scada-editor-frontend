@@ -22,6 +22,9 @@ export function buildItemMenu(el: DiagramElement, deps: BuildItemMenuDeps): Canv
   const isPlainGroup = el.type === "group" && !el.isComponent;
   const isComponent = el.type === "group" && !!el.isComponent;
 
+  // В палитру уходит поддерево целиком: и группа с потомками, и одиночный элемент
+  // (у него getDescendants вернёт пустой список). Корень всегда первый в массиве —
+  // на этом порядке стоит findTemplateRoot.
   const handleFaceplate = () => {
     const allDescendants = getDescendants(el.key, elements);
     OpenCreateFaceplateModal([el, ...allDescendants]);
@@ -47,20 +50,24 @@ export function buildItemMenu(el: DiagramElement, deps: BuildItemMenuDeps): Canv
   };
 
   const items: (CanvasMenuItem | null)[] = [
-    { label: "Добавить свойство", onClick: () => { handleAddProperty(el.id); closeMenu(); }, disabled: !el.id },
+    { label: "Добавить свойство", onClick: () => { handleAddProperty(el.key); closeMenu(); } },
     { label: "На передний план", onClick: () => { useEditorStore.getState().bringToFront(el.key); closeMenu(); } },
     { label: "На задний план", onClick: () => { useEditorStore.getState().sendToBack(el.key); closeMenu(); } },
     // Пункты задаём явно. Раньше они брались из editorElementMenuItems, а действие
     // выбиралось СРАВНЕНИЕМ РУССКОЙ ПОДПИСИ; исходные обработчики там — заглушки
     // console.log, поэтому любая опечатка или переименование подписи молча
     // превращали пункт в no-op.
+    { label: "Повернуть по часовой", onClick: () => { useEditorStore.getState().transformSelected("cw"); closeMenu(); } },
+    { label: "Повернуть против часовой", onClick: () => { useEditorStore.getState().transformSelected("ccw"); closeMenu(); } },
+    { label: "Отразить по горизонтали", onClick: () => { useEditorStore.getState().transformSelected("flipH"); closeMenu(); } },
+    { label: "Отразить по вертикали", onClick: () => { useEditorStore.getState().transformSelected("flipV"); closeMenu(); } },
     { label: "Копировать", onClick: () => { copySelectedElement(); closeMenu(); } },
     { label: "Переместить в группу", onClick: () => { openMoveToGroup(el.key); closeMenu(); } },
     { label: "Удалить", onClick: () => { deleteSelectedElement(); closeMenu(); }, variant: "danger" },
     isPlainGroup ? { label: "Создать компонент", onClick: handleCreateComponent } : null,
     isComponent ? { label: "Добавить компонент", onClick: () => { openAddComponent(el.key); closeMenu(); } } : null,
     isComponent ? { label: "Разобрать компонент", onClick: handleDisassemble } : null,
-    el.type === "group" ? { label: "Сохранить в палитру", onClick: handleFaceplate } : null,
+    { label: "Сохранить в палитру", onClick: handleFaceplate },
   ];
 
   return items.filter((i): i is CanvasMenuItem => Boolean(i));

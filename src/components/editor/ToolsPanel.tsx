@@ -1,23 +1,35 @@
 import React, {useRef, useState} from "react";
 import {useStore} from "zustand";
 import {useShallow} from "zustand/react/shallow";
-import {useEditorStore} from "@/store/useEditorStore";
+import {useEditorStore, SCENE_EXPORT_FORMAT} from "@/store/useEditorStore";
 import {
-  Save, Group, Ungroup, FilePlus, FolderOpen, Briefcase, Upload,
-  Undo2, Redo2, Loader2, History, RotateCcw,
+  Save, Group, Ungroup, FilePlus, FolderOpen, Briefcase, Upload, Download,
+  Undo2, Redo2, Loader2, History, RotateCcw, Rocket,
+  RotateCw, FlipHorizontal, FlipVertical,
   AlignStartVertical, AlignCenterVertical, AlignEndVertical,
   AlignStartHorizontal, AlignCenterHorizontal, AlignEndHorizontal,
   AlignHorizontalSpaceBetween, AlignVerticalSpaceBetween,
 } from "lucide-react";
+import {downloadJson, safeFileName} from "@/lib/downloadJson";
 import {choiceModal} from "@/components/ui/ConfirmModal";
+import {
+  buildDeviceLayout,
+  isDeviceLayoutFile,
+  type DeviceLayoutFile,
+} from "@/lib/editor/deviceLayoutImport";
+import {openDeviceImportReportModal} from "@/components/editor/OpenDeviceImportReportModal";
 import {openChooseSceneModal} from "@/components/ui/OpenChooseSceneModal";
 import {openProjectModal} from "@/components/ui/ProjectModal";
+import {openReleasesModal} from "@/components/editor/releases/ReleasesModal";
 import {usePaletteStore} from "@/store/usePaletteStore";
 import {toast} from "sonner";
 import VersionHistoryPanel from "@/components/editor/versions/VersionHistoryPanel";
 import SaveConflictDialog from "@/components/editor/versions/SaveConflictDialog";
 import VersionPreviewBanner from "@/components/editor/versions/VersionPreviewBanner";
 import StaleVersionBanner from "@/components/editor/versions/StaleVersionBanner";
+import SceneChangedBanner from "@/components/editor/versions/SceneChangedBanner";
+import AutosaveErrorBanner from "@/components/editor/versions/AutosaveErrorBanner";
+import {useCurrentProjectGrant} from "@/lib/access/projectAccess";
 
 function TooltipBtn({
   icon,
@@ -108,6 +120,11 @@ export default function ToolsPanel() {
   // в текущую сцену как чужое прошлое. Одна проверка гасит разом импорт, undo/redo,
   // группировку, выравнивание и сохранение — все они уже завязаны на canEdit.
   const canEdit = sceneBelongsToProject && !versionPreview;
+  // Право правки проекта — отдельно от canEdit: с одним «просмотром» схему можно
+  // «потыкать» локально (undo, группировка, импорт), но не записать на сервер.
+  // Скрываем всё, что пишет: сохранение, новую схему, откат и выпуски.
+  const canWrite = useCurrentProjectGrant().edit;
+  const canSave = canEdit && canWrite;
 
   const handleOpenProject = () => {
     openProjectModal();
@@ -135,6 +152,94 @@ export default function ToolsPanel() {
     importInputRef.current?.click();
   };
 
+  const handleExport = () => {
+    if (!scene) {
+      toast.info("Сначала загрузите или создайте схему");
+      return;
+    }
+
+    const file = useEditorStore.getState().buildSceneExport();
+    if (!file.elements.length) {
+      toast.info("Схема пуста — экспортировать нечего");
+      return;
+    }
+
+    // Дата в имени: файл кладут «себе на компьютер», и через неделю их там несколько.
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadJson(`${safeFileName(scene.name, "scheme")}_${stamp}.json`, file);
+    toast.success(`Сохранено элементов: ${file.elements.length}`);
+  };
+
+  /**
+   * План устройств: «какой шаблон взять и в какие координаты поставить».
+   *
+   * Экземпляры собираются одним массивом и кладутся одним действием — иначе 47 вызовов
+   * `addTemplate` дали бы 47 шагов undo при лимите истории в 50.
+   */
+  const importDeviceLayout = async (file: DeviceLayoutFile) => {
+    // Палитра грузится при монтировании редактора, но если запрос не прошёл, в списке
+    // останутся только статические элементы — без шаблонов импортировать нечего.
+    if (!usePaletteStore.getState().paletteItems.some((i) => i.type === "custom")) {
+      await usePaletteStore.getState().loadPaletteItems();
+    }
+
+    const {scene, addImportedElements} = useEditorStore.getState();
+    const {elements, report} = buildDeviceLayout(
+      file,
+      usePaletteStore.getState().paletteItems,
+      scene?.id ?? null,
+    );
+
+    // Выходим ДО вопроса о режиме: с «Заменить» пустой результат стёр бы всю схему.
+    if (!elements.length) {
+      toast.error("Импорт не дал ни одного элемента", {
+        description: "Ни одного из шаблонов файла нет в палитре.",
+      });
+      openDeviceImportReportModal(report);
+      return;
+    }
+
+    let mode: "append" | "replace" = "replace";
+    if (useEditorStore.getState().elements.length) {
+      const answer = await choiceModal({
+        title: "На схеме уже есть элементы",
+        description: `В файле ${report.devices} устройств, ${report.lines} линий и ${report.junctions} узлов соединения. Что с ними сделать?`,
+        options: [
+          {
+            id: "replace",
+            label: "Заменить содержимое схемы",
+            description: "Текущие элементы будут убраны. Отменяется через Ctrl+Z, на сервере — до ближайшего сохранения.",
+            danger: true,
+          },
+          {
+            id: "append",
+            label: "Добавить к существующим",
+            description: "Импортированное ляжет поверх текущего. Повторный импорт того же файла задвоит элементы.",
+          },
+        ],
+      });
+      if (!answer) return;
+      mode = answer as "append" | "replace";
+    }
+
+    addImportedElements(elements, mode);
+
+    toast.success(`Поставлено устройств: ${report.placed} из ${report.devices}`, {
+      description: [
+        `линий ${report.lines}`,
+        `узлов ${report.junctions}`,
+        `повёрнуто ${report.rotated}`,
+        `отражено ${report.mirrored}`,
+        `элементов на холсте ${elements.length}`,
+      ].join(" · "),
+      duration: 12_000,
+    });
+
+    if (report.missing.length || report.ambiguous.length || report.unsupportedRotation.length) {
+      openDeviceImportReportModal(report);
+    }
+  };
+
   const handleImportFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -147,7 +252,24 @@ export default function ToolsPanel() {
     reader.onload = async (ev) => {
       try {
         const json = JSON.parse(ev.target?.result as string);
-        const arr = Array.isArray(json) ? json : [json];
+
+        // План устройств — объект {devices, lines}, а не массив. Ветка должна стоять
+        // ДО общего распознавания: там объект без нашего конверта заворачивается в
+        // [json] и становится одним мусорным элементом.
+        if (isDeviceLayoutFile(json)) {
+          await importDeviceLayout(json);
+          return;
+        }
+
+        // Свой файл приезжает конвертом (см. buildSceneExport), чужая выгрузка — голым
+        // массивом. Флаг `native` важнее удобства: без него нормализатор CONTUR второй
+        // раз пересчитал бы координаты схемы, однажды пришедшей из выгрузки.
+        const native = !Array.isArray(json)
+          && json?.format === SCENE_EXPORT_FORMAT
+          && Array.isArray(json.elements);
+        const arr: Record<string, unknown>[] = native
+          ? json.elements
+          : (Array.isArray(json) ? json : [json]);
 
         // На непустой схеме спрашиваем: без этого повторный импорт того же листа молча
         // удваивал схему, а замена была недоступна вовсе.
@@ -174,7 +296,7 @@ export default function ToolsPanel() {
           mode = answer as "append" | "replace";
         }
 
-        const stats = useEditorStore.getState().importElementsFromJson(arr, {mode});
+        const stats = useEditorStore.getState().importElementsFromJson(arr, {mode, native});
 
         if (!stats) {
           toast.success(`Импортировано элементов: ${arr.length}`);
@@ -254,7 +376,15 @@ export default function ToolsPanel() {
                 этой подписи пользователь не знал, в безопасности ли его работа.
                 В режиме просмотра версии статус не показываем — там говорит плашка,
                 а «сохранено в …» рядом со старой версией только запутает. */}
-            {scene && !versionPreview && (
+            {currentProject && !canWrite && (
+              <span
+                className="shrink-0 whitespace-nowrap rounded-full bg-amber-500/10 px-2 py-0.5 text-amber-700 dark:text-amber-400"
+                title="У вас право просмотра проекта: правки остаются локальными и не сохраняются"
+              >
+                только просмотр
+              </span>
+            )}
+            {scene && !versionPreview && canWrite && (
               <span className="shrink-0 whitespace-nowrap">
                 {isSaving
                   ? <span className="text-neutral-500 dark:text-neutral-400">сохранение…</span>
@@ -277,11 +407,15 @@ export default function ToolsPanel() {
       <div className="flex gap-1.5 p-1.5 bg-white dark:bg-neutral-900/50 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl pointer-events-auto justify-self-center">
 
         <TooltipBtn icon={<Briefcase size={16} />} label="Проект" onClick={handleOpenProject} />
-        <TooltipBtn icon={<FilePlus size={16} />} label="Создать схему" onClick={handleCreateSchema} />
+        {canWrite && <TooltipBtn icon={<FilePlus size={16} />} label="Создать схему" onClick={handleCreateSchema} />}
         <TooltipBtn icon={<FolderOpen size={16} />} label="Загрузить схему" onClick={handleLoadSchema} />
         <TooltipBtn
           icon={<Upload size={16} />} label="Импорт" onClick={handleImport}
           disabled={!canEdit}
+        />
+        <TooltipBtn
+          icon={<Download size={16} />} label="Экспорт в файл" onClick={handleExport}
+          disabled={!scene || !elements.length}
         />
 
         <div className="w-px h-6 bg-gray-300 dark:bg-white/10 self-center mx-0.5" />
@@ -310,12 +444,20 @@ export default function ToolsPanel() {
           onClick={() => setHistoryOpen(v => !v)}
           disabled={!scene}
         />
-        <TooltipBtn
+        {canWrite && <TooltipBtn
           icon={<RotateCcw size={16} />}
           label="Вернуться к предыдущему сохранению"
           onClick={() => { void useEditorStore.getState().restorePreviousManualVersion(); }}
           disabled={!scene || !!versionPreview}
-        />
+        />}
+        {/* Выпуски — уровень проекта, а не схемы: монитор показывает prod-выпуск, и правки
+            доходят до него только через «Выпустить» и «Сделать prod». */}
+        {canWrite && <TooltipBtn
+          icon={<Rocket size={16} />}
+          label="Выпуски проекта"
+          onClick={() => currentProject && openReleasesModal(currentProject.id, currentProject.name)}
+          disabled={!currentProject}
+        />}
 
         <div className="w-px h-6 bg-gray-300 dark:bg-white/10 self-center mx-0.5" />
 
@@ -330,6 +472,34 @@ export default function ToolsPanel() {
           label="Разгруппировать"
           onClick={() => useEditorStore.getState().ungroupSelected()}
           disabled={!canEdit || !selectedIds.some(id => elements.find(e => e.key === id)?.type === "group")}
+        />
+
+        {/* Поворот на 90° и отражения. Работают и для одного элемента, и для набора,
+            и для группы целиком: геометрия пересчитывается по-настоящему (см.
+            lib/editor/transformSelection.ts), поэтому всё остаётся на сетке. */}
+        <TooltipBtn
+          icon={<RotateCw size={16} />}
+          label="Повернуть по часовой (Shift + >)"
+          onClick={() => useEditorStore.getState().transformSelected("cw")}
+          disabled={!canEdit || !selectedIds.length}
+        />
+        <TooltipBtn
+          icon={<RotateCcw size={16} />}
+          label="Повернуть против часовой (Shift + <)"
+          onClick={() => useEditorStore.getState().transformSelected("ccw")}
+          disabled={!canEdit || !selectedIds.length}
+        />
+        <TooltipBtn
+          icon={<FlipHorizontal size={16} />}
+          label="Отразить по горизонтали (Shift + H)"
+          onClick={() => useEditorStore.getState().transformSelected("flipH")}
+          disabled={!canEdit || !selectedIds.length}
+        />
+        <TooltipBtn
+          icon={<FlipVertical size={16} />}
+          label="Отразить по вертикали (Shift + V)"
+          onClick={() => useEditorStore.getState().transformSelected("flipV")}
+          disabled={!canEdit || !selectedIds.length}
         />
 
         <div className="w-px h-6 bg-gray-300 dark:bg-white/10 self-center mx-0.5" />
@@ -384,20 +554,20 @@ export default function ToolsPanel() {
             ожидался и не было никакого признака работы, поэтому нетерпеливые
             клики выстраивали очередь из полных циклов «сохранение + перезагрузка».
             Точка-индикатор показывает несохранённые изменения. */}
-        <TooltipBtn
+        {canWrite && <TooltipBtn
           icon={isSaving
             ? <Loader2 size={16} strokeWidth={2.5} className="animate-spin" />
             : <Save size={16} strokeWidth={2.5} />}
           label={isSaving ? "Сохранение…" : isDirty ? "Сохранить (есть изменения)" : "Сохранить"}
           onClick={() => { void exportScene(); }}
-          disabled={!canEdit || isSaving}
+          disabled={!canSave || isSaving}
           className="relative flex items-center justify-center w-9 h-9 rounded-xl
             bg-primary/10 border border-primary/30 text-primary
             hover:bg-primary/20 hover:border-primary/40
             active:translate-y-0.5 transition-all
             disabled:opacity-20 disabled:cursor-not-allowed"
           badge={isDirty && !isSaving}
-        />
+        />}
       </div>
 
       <div className="min-w-0 flex justify-end">
@@ -421,7 +591,9 @@ export default function ToolsPanel() {
           вкладке «Редактор». Сама <nav> не ловит указатель (pointer-events-none),
           поэтому потомки включают его себе сами. */}
       <VersionPreviewBanner />
+      <SceneChangedBanner />
       <StaleVersionBanner />
+      <AutosaveErrorBanner />
       <div className="pointer-events-auto">
         <VersionHistoryPanel open={historyOpen} onClose={() => setHistoryOpen(false)} />
       </div>

@@ -53,6 +53,24 @@ leaves whose live position sits in overrides.
 - Each element has `states` (`ComponentState[]`, e.g. "Нормальное"/"Авария"). State changes
   propagate across a subtree **by state name**; `currentComponentStateByElementKey` tracks the
   active state per element.
+- **The state NAME is a join key in four places, so all three state actions cascade over
+  `[key, ...getDescendantKeys(key)]`** (add / remove / **rename**, store `~:1390-1553`):
+  (a) `cascadeStateByName` matches parent↔descendant by name — a miss silently drops the
+  descendant to its default state; (b) `buildShapeDescriptor` picks the composition primitive's
+  state by name when baking — a miss **bakes the wrong visuals**; (c) the monitor's
+  `setState("Имя")` intent is resolved by name in `applyRuntimeBatch` and a miss is **silently
+  skipped**; (d) the backend merges by name when no id is sent. Names must therefore be unique
+  per element — nothing enforced it before rename, so the rename path validates the collision.
+- **Rename specifics** (`renameComponentStateInSubtree` + `src/lib/editor/stateNameRefs.ts`):
+  spread the state so `serverId` survives — it is the *only* thing that makes the backend read a
+  rename instead of delete+create (`docs/contract/frontend-contract-changes.md:306`,
+  `buildComponentTree.ts:189-192`). `currentComponentStateByElementKey` needs no touching (keyed
+  by `id`, which doesn't change). User code carries the name as a **string literal**
+  (`setState("Авария")`) in `bindings[].code` and `events[].handler.code` — `findStateUsages`
+  lists them and the rename optionally rewrites them **in the same `set()`** (one undo step).
+  The scan is scoped to the renamed subtree, never the whole scene: an element outside it with a
+  same-named state owns a *different* state. `scripts[].content` is a server-side Java bridge —
+  no `setState` there, don't scan it.
 - `updateElementVisual(key, patch)` writes `patch` into the current state's overrides for leaves
   (into base for groups), clamps w/h to `MIN_SIZE`, and calls `recomputeAncestorBounds` when a
   positional key changed. `updateElement` writes structural fields (scripts, properties, …).
@@ -92,11 +110,54 @@ leaves whose live position sits in overrides.
   `moveSelectedBy(dx, dy, excludeKey)` on dragend (their Konva positions are restored first —
   line/circle groups have no controlled x/y, React wouldn't reset them). Every resize/vertex
   handle MUST carry `name="resize-handle"` — that's what excludes it from starting a session.
-- **Z-order**: render order = flat-array order (top level) + parent `composition`/`children`
-  order (nested). `bringToFront`/`sendToBack` reorder both; context-menu items in
-  `buildItemMenu.ts`. Note composition always renders below children inside a component.
-- Zoom UI: `canvas/ZoomControls.tsx` (±20% around viewport center, fit-to-content, 100%);
-  absolute camera setter `setCamera(x, y, zoom)` in the store. Zoom clamp [0.2, 3].
+- **Z-order**: `zIndex` on `BaseCanvasElement` (CSS-like, **scoped to siblings** — same
+  `parentKey`), applied by `src/lib/editor/zOrder.ts` (`sortByZIndex`/`sortKeysByZIndex`,
+  missing == 0). The sort is **stable**, so equal z falls back to the old positional order —
+  flat-array order at the top level, `composition`+`children` concatenation inside a container
+  (that's why legacy scenes look identical). Two render sites: `Canvas.tsx` root list (sorted
+  *before* culling — `viewportCulling` only filters) and `GroupNode` members via
+  `useOrderedMemberKeys` (its own `useShallow` subscription — the ctx deliberately carries no
+  scene data). Composition and children are sorted as **one pool**, so a primitive can now sit
+  above a nested component. `bringToFront`/`sendToBack` just set `zIndex` to `max+1`/`min−1`
+  among siblings (they no longer shuffle arrays); context-menu items in `buildItemMenu.ts`.
+  **`zIndex` lives in the element BASE, never in state overrides** — `BASE_ONLY_KEYS` +
+  `splitBaseOnly` in `updateElementsVisual` route it there even for leaves, and
+  `transformElements` strips it from overrides (`STRUCTURAL_KEYS`) while reading it explicitly
+  from the unstripped image. Leave it in overrides and `{...base, ...overrides}` silently
+  resurrects the old layer on the next save. Panel field: `Z_INDEX_FIELD` in
+  `basePropertySchema` (every type) and prepended in `MultiPropertiesPanel`.
+- **Sheet (лист)**: the scene has a real size, `src/lib/editor/sheet.ts` —
+  `resolveSheet(elements)` (cached by array ref, like `getElementIndex`) reads it from the
+  `canvas: {width, height}` block of the service element (`visible:false`, `type:"meta"` —
+  CONTUR's `contur_meta`), falling back to `DEFAULT_SHEET` (A3, 11900×8400). **Derived, never
+  stored in the store** — otherwise it would need syncing at load/save/restore/preview/import
+  and a missed one shows the previous scene's sheet. Written by `setSheet(w,h)`, which edits
+  that element (there is NO scene update endpoint — scenes only have GET/POST-create/DELETE,
+  so scene-level metadata has nowhere else to live). Size is a **number, not a paper format**:
+  the same A3 spans 7470–16200 units depending on symbol density. The frame is a hint, not a
+  clamp — nothing bounds coordinates. `CANVAS_WIDTH/HEIGHT = 5000` are gone.
+- Zoom UI: `canvas/ZoomControls.tsx` (±20% around viewport center, fit-to-content,
+  **fit-to-sheet**, 100%); absolute camera setter `setCamera(x, y, zoom)` in the store.
+  Zoom clamp **[0.03, 3]**, single source `src/lib/editor/zoomLimits.ts` (it used to be two
+  independent copies that drifted); 0.03 because A0 (21520×15240) is 0.039 in a laptop window.
+- **Grid step follows zoom** (`gridPattern.ts`): the pattern lives in world coords, so at
+  fit-A0 a 20-unit cell is ~1px of grey mush. ≥0.25 → fine (20) + `GRID_MAJOR` (200);
+  ≥0.01 → major only; below → no grid. Drawn only inside the sheet rect.
+- **Interaction scope — group contents are inert until entered.** `GroupNode` wraps its members
+  in an extra `<Group listening={useMembersInteractive(group.key)}>`; the group's own background
+  hit `Rect` stays listening. The flag is "the active scope is this group **or deeper**" — the
+  ancestor walk is not optional: without it, entering a nested group would switch off the outer
+  group's wrapper and, since Konva's `listening:false` kills the **whole subtree**, the nested
+  group with it. This is also why the flag can't go on the group's own `<Group>` — that would
+  take its hit `Rect` down too, and the group could neither be selected nor opened.
+  One flag kills click, dblclick, drag and hover together, so shapes need no per-handler guards.
+  `resolveClickTarget` still exists but now only re-points what actually reached the hit graph;
+  before this, a nested circle swallowed the double-click (`e.cancelBubble = true`) and opened
+  text editing instead of letting `GroupNode` enter the group. The monitor is unaffected — there
+  the whole layer is `listening={false}` and clicks go through `MonitorInteractionLayer`.
+  Selecting a nested element from the Layers panel goes through `revealElement` (store), which
+  opens the element's level and selects it in one `set()` — `enterGroup` clears `selectedIds`,
+  so doing it in two calls would race.
 - **Hover highlight** (Figma-style "what click will select"): Stage `onMouseOver` resolves the
   target via `resolveClickTarget` → `hoveredKey` (Canvas state); drawn as ONE overlay `Rect`
   in the Layer (group frame for groups, rendered bounds for leaves). Deliberately NOT passed
@@ -148,6 +209,35 @@ convert screen→world before placing.
   that has draggable children with `if (e.target !== e.currentTarget) return;` (see
   `ButtonShapeElement`, `TextShapeElement`). The handle itself sets `e.cancelBubble=true` on
   `onDragStart` only — that stops the group from *starting* a drag, not the bubbled move/end.
+
+## Table: properties + per-cell bindings
+
+A table's tag properties belong to the **whole element** (`element.properties`, edited on the
+ordinary «Свойства» tab like any other element). Which field of which property lands in which
+cell is described by **`bindings[].cell`** (`{row, col, propertyName, field}`), and the single
+place that knows the rule is `src/lib/editor/tableBindings.ts` (`resolveCellText`,
+`cellBindingAt`, `cellBindings`, `CELL_SOURCE_FIELDS`).
+
+- **Only `field: "value"` goes through the runtime.** `name`/`tag_id`/`value_type`/
+  `property_type`/`default_value`/`description` are static — they live in `element.properties`
+  and the renderer reads them directly, identically in editor and monitor. That is why the
+  feature costs almost no new plumbing.
+- **The property is addressed by NAME**, never by `id`: `propertyId` is unstable across
+  table re-saves (`runtimeConnection.ts`), and recipes (`row_name`) and the WS frame
+  (`propertyName`) already key by name.
+- Cell text precedence: bound static field → property field; bound `value` → runtime override
+  `cell_R_C`, falling back to the property's `default_value`; unbound → free text in
+  `cells["R_C"].value`. A binding pointing at a deleted/renamed property renders **empty**,
+  never the stale name.
+- Runtime routing lives in `bindingIndex.tableCellsByTagId` / `tableCellsByPropertyName`, built
+  from the bindings; one property may feed several cells. The old `TABLE_ROW_VALUE_COL = 2`
+  constant and the `position`-as-row convention are gone.
+- **Recipes need nothing table-specific**: `RecipesPanel`/`ApplyRecipeModal` take
+  `sortByRow(component.properties)` — all table properties, keyed by name. `position` is only
+  display order (as its own doc says).
+- Legacy tables (properties with numeric `position`, no cell bindings) are converted on load by
+  `migrateTableRowBindings` in `transformElements.ts` — name→col 1, value→col 2, and the old
+  synthetic row number frozen into `cells["R_0"]`. Idempotent, guarded by "has no cell binding".
 
 ## Adding a new element type (5 touch points)
 
@@ -201,6 +291,36 @@ Keep the round-trip symmetric when changing one side. Headless check: transpile 
 `createUuid` and run `buildComponentTree → transformElements` in Node (near-zero runtime deps) —
 `npx tsc src/lib/{buildComponentTree,transformElements,createUuid}.ts --module commonjs --target
 es2020 --noResolve --skipLibCheck --outDir <scratch>`, then sed `@/lib/createUuid` → `./createUuid`.
+
+## Palette templates (`buildPaletteComponentTree` ↔ `addTemplate`)
+
+A template is a whole subtree saved to the palette; it must carry states, properties, bindings,
+scripts and events — not just geometry. Its DTO has **no server ids at any level** (§2 of the
+version contract — that's why templates have no merge), so **entities link by NAME**.
+
+- **Tag properties travel WITHOUT the tag.** `tag_id: null`, `property_type: "Тег"` kept — the
+  type is what says "a tag is needed here"; the tag itself belongs to the instance. (Before, tag
+  properties were `filter`ed out entirely, so a template lost the thing it's mostly saved for.)
+  `id`/`component_id` are stripped.
+- **`component_property_id` is never emitted into a template** (it addressed the *source scene's*
+  property); `component_property_name` is emitted instead. In the scene path nothing changed.
+  When an element has no saved property at all the field is now **omitted rather than `0`** —
+  a zero property doesn't exist and the backend rejects the whole scene over it.
+- **`propertyRefs`** live inside the opaque `script` JSON, so nothing strips them automatically:
+  the template drops `propertyId`/`componentId` and keeps `componentKey` + `propertyName`.
+  `addTemplate` remaps `componentKey` through its `keyMap`; `addTags` fills `propertyId` back in
+  via `resolvePendingPropertyRefs` when the tag is finally assigned.
+- **Composition is baked** into `states[].image` exactly like the scene path — without it a
+  component came back with `isComponent: true` and an empty `composition`, i.e. stopped being a
+  component and its primitives became ordinary children.
+- **Properties are ordinary scene data** (see CLAUDE.md «Properties travel with the scene»):
+  `buildComponentNode` sends the complete `element.properties` list for every element type, the
+  backend upserts by id-then-name and deletes what is missing, and a binding attaches to a
+  property created in the same request by `component_property_name`. So a template instance needs
+  no provisioning pass at all — its properties are created by the very save that creates its
+  elements. `addProperty`/`editProperty`/`deleteProperty` are local, undoable, and address the
+  owner **by element key** (`component_id` is null until the first save). The one surviving
+  network call is renaming a saved property (recipe values migrate only there).
 
 ## Undo / history (zundo `temporal`)
 

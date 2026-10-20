@@ -10,6 +10,7 @@ export const elementRegistry: Record<ElementType, { complex: boolean }> = {
   rectangle: { complex: false },
   circle: { complex: false },
   arc: { complex: false },
+  curve: { complex: false },
   line: { complex: false },
   group: { complex: false },
   toggle: { complex: false },
@@ -42,6 +43,7 @@ export const elementTypeLabels: Record<ElementType, string> = {
   rectangle: "Прямоугольник",
   circle: "Окружность",
   arc: "Дуга",
+  curve: "Кривая линия",
   line: "Линия",
   group: "Группа",
   toggle: "Переключатель",
@@ -80,16 +82,72 @@ export const ROTATABLE_TYPES: ReadonlySet<ElementType> = new Set<ElementType>([
   "toggle",
 ]);
 
+/**
+ * Слой отрисовки — есть у КАЖДОГО элемента (поле `zIndex` объявлено на
+ * `BaseCanvasElement`). Сортировка идёт среди соседей одного контейнера, как в CSS.
+ *
+ * Экспортируется отдельно, потому что мультивыделение собирает схему только из
+ * `elementPropertyMap` и `basePropertySchema` не подмешивает.
+ */
+export const Z_INDEX_FIELD: PropertySchema = {
+  key: "zIndex",
+  label: "Слой (z-index)",
+  type: "number",
+  min: -999,
+  max: 999,
+  step: 1,
+  defaultValue: 0,
+};
+
 export const basePropertySchema: PropertySchema[] = [
   {
     key: "label",
     label: "Название",
     type: "text",
   },
+  Z_INDEX_FIELD,
 ];
+
+/**
+ * Стиль обводки — один и тот же пункт у всех фигур с контуром.
+ *
+ * Значение уходит в `strokeDasharray` и разбирается общим `parseDashArray`
+ * (`lib/editor/dashArray.ts`), который читают все ветки рендера.
+ */
+const DASH_FIELD: PropertySchema = {
+  key: "strokeDasharray",
+  label: "Стиль (пунктир)",
+  type: "select",
+  options: [
+    {label: "Сплошная", value: ""},
+    {label: "Пунктир", value: "5 5"},
+    {label: "Штрих-пунктир", value: "10 5 2 5"},
+  ],
+  defaultValue: "",
+};
 
 export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
   rectangle: [
+    {
+      key: "text",
+      label: "Надпись",
+      type: "text",
+      defaultValue: "",
+    },
+    {
+      key: "fontSize",
+      label: "Кегль надписи",
+      type: "number",
+      min: 6,
+      max: 200,
+      defaultValue: 14,
+    },
+    {
+      key: "textColor",
+      label: "Цвет надписи",
+      type: "color",
+      defaultValue: "#ffffff",
+    },
     {
       key: "bg",
       label: "Цвет заливки",
@@ -110,6 +168,7 @@ export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
       max: 20,
       defaultValue: 2,
     },
+    DASH_FIELD,
     {
       key: "rx",
       label: "Скругление углов (X)",
@@ -128,6 +187,26 @@ export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
     },
   ],
   circle: [
+    {
+      key: "text",
+      label: "Надпись",
+      type: "text",
+      defaultValue: "",
+    },
+    {
+      key: "fontSize",
+      label: "Кегль надписи",
+      type: "number",
+      min: 6,
+      max: 200,
+      defaultValue: 14,
+    },
+    {
+      key: "textColor",
+      label: "Цвет надписи",
+      type: "color",
+      defaultValue: "#ffffff",
+    },
     {
       key: "radius",
       label: "Радиус",
@@ -194,16 +273,36 @@ export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
       max: 20,
       defaultValue: 2,
     },
+    DASH_FIELD,
+  ],
+  curve: [
+    // Форма правится ручками на холсте: два конца и две направляющие точки.
     {
-      key: "strokeDasharray",
-      label: "Стиль (пунктир)",
-      type: "select",
-      options: [
-        {label: "Сплошная", value: ""},
-        {label: "Пунктир", value: "5 5"},
-        {label: "Штрих-пунктир", value: "10 5 2 5"},
-      ],
-      defaultValue: "",
+      key: "strokeColor",
+      label: "Цвет линии",
+      type: "color",
+      defaultValue: "#9ca3af",
+    },
+    {
+      key: "strokeWidth",
+      label: "Толщина",
+      type: "number",
+      min: 1,
+      max: 20,
+      defaultValue: 2,
+    },
+    DASH_FIELD,
+    {
+      key: "arrowStart",
+      label: "Стрелка в начале",
+      type: "boolean",
+      defaultValue: false,
+    },
+    {
+      key: "arrowEnd",
+      label: "Стрелка в конце",
+      type: "boolean",
+      defaultValue: false,
     },
   ],
   line: [
@@ -221,17 +320,7 @@ export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
       max: 20,
       defaultValue: 3,
     },
-    {
-      key: "strokeDasharray",
-      label: "Стиль (пунктир)",
-      type: "select",
-      options: [
-        {label: "Сплошная", value: ""},
-        {label: "Пунктир", value: "5 5"},
-        {label: "Штрих-пунктир", value: "10 5 2 5"},
-      ],
-      defaultValue: "",
-    },
+    DASH_FIELD,
     {
       key: "arrowEnd",
       label: "Стрелка в конце",
@@ -268,6 +357,7 @@ export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
       max: 20,
       defaultValue: 2,
     },
+    DASH_FIELD,
   ],
   path: [
     {
@@ -432,8 +522,11 @@ export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
   ],
   button: [
     { key: "color", label: "Цвет фона", type: "color", defaultValue: "#3b82f6" },
-    { key: "label", label: "Текст", type: "text", defaultValue: "Кнопка" },
+    // Подпись — `text`, а не `label`: `label` — название элемента (поле «Название» выше), и
+    // общий ключ связывал их — переименование кнопки меняло надпись и наоборот.
+    { key: "text", label: "Текст", type: "text", defaultValue: "Кнопка" },
     { key: "textColor", label: "Цвет текста", type: "color", defaultValue: "#ffffff" },
+    { key: "fontSize", label: "Размер текста", type: "number", min: 8, max: 72, defaultValue: 16 },
     { key: "rx", label: "Скругление углов", type: "number", min: 0, max: 40, defaultValue: 6 },
     { key: "pressed", label: "Нажата (превью)", type: "boolean", defaultValue: false },
     { key: "enabled", label: "Активна", type: "boolean", defaultValue: true },
@@ -495,7 +588,11 @@ export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
     { key: "arcEnd", label: "Конец дуги (°)", type: "number", min: 0, max: 270, defaultValue: 40 },
   ],
   table: [
-    { key: "rows", label: "Строк", type: "number", min: 1, max: 20, defaultValue: 4 },
+    // Потолок в 1000 строк — не про рендер, а про смысл: таблица на тысячу строк это
+    // список уставок целиком, и раньше он просто не помещался. Высота строки считается
+    // от высоты таблицы (веса нормируются в tableLayout), поэтому таблицу под такое
+    // число строк надо растянуть — иначе строки схлопнутся в неразличимую полосу.
+    { key: "rows", label: "Строк", type: "number", min: 1, max: 1000, defaultValue: 4 },
     { key: "cols", label: "Столбцов", type: "number", min: 1, max: 10, defaultValue: 3 },
     { key: "headerText", label: "Заголовок", type: "text", defaultValue: "Таблица" },
     { key: "backgroundColor", label: "Цвет фона", type: "color", defaultValue: "#1e293b" },
@@ -508,18 +605,16 @@ export const elementPropertyMap: Record<ElementType, PropertySchema[]> = {
     { key: "alternateColor", label: "Цвет чётных строк", type: "color", defaultValue: "#0f172a" },
   ],
   trend: [
+    // Перья, окно и масштаб — на вкладке «Свойства» (TrendSettingsBlock): перо — это
+    // тег-свойство, а его масштаб и цвет живут в `trend.pens`, общих min/max больше нет.
     { key: "title", label: "Заголовок", type: "text", defaultValue: "Тренд" },
-    { key: "lineColor", label: "Цвет линии", type: "color", defaultValue: "#3b82f6" },
     { key: "backgroundColor", label: "Цвет фона", type: "color", defaultValue: "#1e293b" },
     { key: "strokeColor", label: "Цвет рамки", type: "color", defaultValue: "#475569" },
     { key: "textColor", label: "Цвет текста", type: "color", defaultValue: "#94a3b8" },
     { key: "gridColor", label: "Цвет сетки", type: "color", defaultValue: "#1e3a5f" },
     { key: "showGrid", label: "Сетка", type: "boolean", defaultValue: true },
-    { key: "showDots", label: "Точки данных", type: "boolean", defaultValue: false },
-    { key: "filled", label: "Заливка под линией", type: "boolean", defaultValue: false },
-    { key: "fillColor", label: "Цвет заливки", type: "color", defaultValue: "#1d4ed8" },
-    { key: "min", label: "Мин. значение оси Y", type: "number", defaultValue: 0 },
-    { key: "max", label: "Макс. значение оси Y", type: "number", defaultValue: 100 },
+    { key: "showLegend", label: "Легенда перьев", type: "boolean", defaultValue: true },
+    { key: "showDots", label: "Точки изменений", type: "boolean", defaultValue: false },
   ],
   chart: [
     { key: "title", label: "Заголовок", type: "text", defaultValue: "График" },

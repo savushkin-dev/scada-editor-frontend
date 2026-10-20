@@ -1,20 +1,19 @@
 "use client";
 
 import {useModalStore} from "@/store/modalStore";
-import * as Select from "@radix-ui/react-select";
 import {cn} from "@/lib/utils";
-import {ChevronDown} from "lucide-react";
+import {Gauge, Link2, Power, PowerOff, Rocket, X} from "lucide-react";
 import * as Dialog from "@radix-ui/react-dialog";
-import SelectItem from "./SelectItem";
-import {
-  selectContentClassName,
-  selectIconClassName,
-  selectScrollButtonClassName,
-  selectTriggerClassName,
-} from "@/components/ui/selectStyles";
-import {useState, useEffect} from "react";
-import {useEditorStore} from "@/store/useEditorStore";
+import {useState, useEffect, useMemo} from "react";
+import {useEditorStore, type EditorProject} from "@/store/useEditorStore";
 import {openChooseSceneModal} from "@/components/ui/OpenChooseSceneModal";
+import {confirmModal} from "@/components/ui/ConfirmModal";
+import {openAutobindModal} from "@/components/ui/OpenAutobindModal";
+import {openReleasesModal} from "@/components/editor/releases/ReleasesModal";
+import {Button, ModalFooter} from "@/components/ui/Button";
+import {openProcedureLevelsModal} from "@/components/editor/ProcedureLevelsModal";
+import {canOpenInEditor, grantOf} from "@/lib/access/projectAccess";
+import {useSessionUserStore} from "@/store/useSessionUserStore";
 
 async function selectProjectAndOpenScenes(
   projectId: number,
@@ -38,9 +37,22 @@ async function selectProjectAndOpenScenes(
 
 export function ProjectContent() {
   const {closeModal} = useModalStore();
-  const projectList = useEditorStore(state => state.projectList);
+  const allProjects = useEditorStore(state => state.projectList);
+  const admin = useSessionUserStore(state => state.admin);
+  // С одним «управлением» проект в редакторе не открывается (бэкенд ответит 403) — не
+  // показываем его вовсе. Список стора остаётся полным: он же кормит монитор.
+  // useMemo: от списка зависят эффекты ниже, новый массив на каждый рендер их зациклил бы.
+  const projectList = useMemo(
+    () => allProjects.filter(p => canOpenInEditor(grantOf(p, admin))),
+    [allProjects, admin],
+  );
   const loadProjectList = useEditorStore(state => state.loadProjectList);
   const createProject = useEditorStore(state => state.createProject);
+  const deleteProject = useEditorStore(state => state.deleteProject);
+  const runtimeFlags = useEditorStore(state => state.projectRuntimeFlags);
+  const prodVersions = useEditorStore(state => state.projectProdVersions);
+  const loadProjectRuntimeFlag = useEditorStore(state => state.loadProjectRuntimeFlag);
+  const setProjectInOperation = useEditorStore(state => state.setProjectInOperation);
   const [selectedValue, setSelectedValue] = useState<string>("");
   const [newName, setNewName] = useState("");
   const [isCreating, setIsCreating] = useState(false);
@@ -48,6 +60,37 @@ export function ProjectContent() {
   useEffect(() => {
     void loadProjectList();
   }, [loadProjectList]);
+
+  // Флаг эксплуатации приходит отдельным эндпоинтом на каждый проект: в списке проектов
+  // бэкенд его не отдаёт. Список короткий, поэтому спрашиваем по одному.
+  useEffect(() => {
+    for (const proj of projectList) void loadProjectRuntimeFlag(proj.id);
+  }, [projectList, loadProjectRuntimeFlag]);
+
+  const handleToggleOperation = async (e: React.MouseEvent, proj: EditorProject) => {
+    e.stopPropagation();
+    const next = !runtimeFlags[proj.id];
+    if (!next) {
+      // Вывод из эксплуатации гасит проект целиком: останавливаются серверные скрипты и
+      // идущие процедуры (мойка прервётся на текущем шаге).
+      const ok = await confirmModal({
+        title: `Вывести «${proj.name}» из эксплуатации?`,
+        description: "Рантайм остановит проект: прекратятся обработчики изменений и идущие "
+          + "процедуры, мониторы этого проекта отключатся.",
+        confirmLabel: "Вывести",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    await setProjectInOperation(proj.id, next);
+  };
+
+  // Состояния занятости строке не заводим: диалог открывается через тот же `modalStore`,
+  // то есть заменяет собой окно проектов, и «занятой» строки на экране не остаётся.
+  const handleAutobind = (e: React.MouseEvent, proj: EditorProject) => {
+    e.stopPropagation();
+    openAutobindModal(proj.id, proj.name);
+  };
 
   useEffect(() => {
     if (projectList.length > 0 && !selectedValue) {
@@ -59,6 +102,22 @@ export function ProjectContent() {
     const proj = projectList.find(p => String(p.id) === selectedValue);
     if (!proj) return;
     await selectProjectAndOpenScenes(proj.id, proj.name);
+  };
+
+  const handleDelete = async (e: React.MouseEvent, proj: EditorProject) => {
+    e.stopPropagation();
+    const ok = await confirmModal({
+      title: `Удалить проект «${proj.name}»?`,
+      description: "Проект и все его схемы со всеми элементами будут удалены. Действие необратимо.",
+      confirmLabel: "Удалить",
+      danger: true,
+    });
+    if (!ok) return;
+
+    await deleteProject(proj.id);
+    // Локальную копию списка не держим: projectList приходит из стора, deleteProject его
+    // уже обновил. Сброс выбора отдаёт его эффекту выше — тот подставит первый оставшийся.
+    if (selectedValue === String(proj.id)) setSelectedValue("");
   };
 
   const handleCreate = async () => {
@@ -81,43 +140,119 @@ export function ProjectContent() {
     <>
       <Dialog.Title className="text-xl font-semibold mb-1">Выберите проект</Dialog.Title>
       <Dialog.Description className="text-gray-600 dark:text-gray-400 mb-6 text-sm">
-        Выберите существующий проект или создайте новый. После выбора откроется список схем проекта.
+        {admin
+          ? "Выберите существующий проект или создайте новый. После выбора откроется список схем проекта."
+          : "Выберите проект. После выбора откроется список схем проекта."}
       </Dialog.Description>
-      {projectList.length > 0 ? (
-        <Select.Root value={selectedValue} onValueChange={setSelectedValue}>
-          <Select.Trigger className={selectTriggerClassName}>
-            <Select.Value placeholder="Выберите проект..." />
-            <Select.Icon>
-              <ChevronDown className={selectIconClassName} />
-            </Select.Icon>
-          </Select.Trigger>
-          <Select.Portal>
-            <Select.Content position="popper" sideOffset={6} className={selectContentClassName}>
-              <Select.ScrollUpButton className={selectScrollButtonClassName}>
-                <ChevronDown className="h-4 w-4 rotate-180" />
-              </Select.ScrollUpButton>
-              <Select.Viewport className="p-1.5">
-                <Select.Group>
-                  {projectList.map((proj) => (
-                    <SelectItem key={proj.id} value={String(proj.id)}>
-                      {proj.name}
-                    </SelectItem>
-                  ))}
-                </Select.Group>
-              </Select.Viewport>
-              <Select.ScrollDownButton className={selectScrollButtonClassName}>
-                <ChevronDown className="h-4 w-4" />
-              </Select.ScrollDownButton>
-            </Select.Content>
-          </Select.Portal>
-        </Select.Root>
-      ) : (
+      {projectList.length === 0 ? (
         <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
-          Проектов пока нет. Создайте первый проект ниже.
+          {admin
+            ? "Проектов пока нет. Создайте первый проект ниже."
+            : "Нет проектов, доступных для просмотра или правки. Права выдаёт администратор."}
         </p>
+      ) : (
+        <ul className="max-h-60 overflow-y-auto rounded-lg border border-neutral-200 dark:border-neutral-700 divide-y divide-neutral-100 dark:divide-neutral-800">
+          {projectList.map(proj => (
+            // Раньше это был выпадающий Select. Кнопку удаления в Select.Item вложить
+            // нельзя (он сам интерактивен), поэтому строка — <li> с двумя кнопками,
+            // ровно как в модалке выбора схемы.
+            <li
+              key={proj.id}
+              className={cn(
+                "flex items-center justify-between px-3 py-2.5 text-sm transition-colors",
+                selectedValue === String(proj.id)
+                  ? "bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300"
+                  : "hover:bg-neutral-50 dark:hover:bg-neutral-800 text-neutral-800 dark:text-neutral-200"
+              )}
+            >
+              <button
+                type="button"
+                aria-pressed={selectedValue === String(proj.id)}
+                onClick={() => setSelectedValue(String(proj.id))}
+                className="min-w-0 flex-1 truncate text-left cursor-pointer"
+              >
+                {proj.name}
+              </button>
+              {/* Какой выпуск исполняется (или будет при вводе в эксплуатацию). */}
+              {prodVersions[proj.id] != null && (
+                <span
+                  className="ml-2 shrink-0 rounded-full bg-neutral-500/10 px-1.5 py-0.5 text-[10px] font-medium text-neutral-500 dark:text-neutral-400"
+                  title="prod-выпуск: его показывает монитор и исполняет runtime"
+                >
+                  prod №{prodVersions[proj.id]}
+                </span>
+              )}
+              {(() => {
+                const grant = grantOf(proj, admin);
+                return (<>
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); openProcedureLevelsModal(proj.id, proj.name, grant.edit); }}
+                className="ml-2 shrink-0 p-0.5 rounded text-neutral-400 hover:text-indigo-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors"
+                title="Уровни доступа операций процедур"
+                aria-label={`Уровни процедур проекта «${proj.name}»`}
+              >
+                <Gauge size={14} />
+              </button>
+              {/* Выпуски, эксплуатация и автопривязка — только с правом правки (бэкенд: 403 NO_EDIT). */}
+              {grant.edit && <>
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); openReleasesModal(proj.id, proj.name); }}
+                className="ml-2 shrink-0 p-0.5 rounded text-neutral-400 hover:text-indigo-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors"
+                title="Выпуски проекта: выпустить черновик, сделать prod"
+                aria-label={`Выпуски проекта «${proj.name}»`}
+              >
+                <Rocket size={14} />
+              </button>
+              <button
+                type="button"
+                aria-pressed={runtimeFlags[proj.id] === true}
+                onClick={(e) => void handleToggleOperation(e, proj)}
+                className={cn(
+                  "ml-2 shrink-0 p-0.5 rounded transition-colors",
+                  runtimeFlags[proj.id]
+                    ? "text-emerald-500 hover:bg-emerald-100 dark:hover:bg-emerald-900/40"
+                    : "text-neutral-400 hover:text-emerald-500 hover:bg-emerald-100 dark:hover:bg-emerald-900/40",
+                )}
+                title={runtimeFlags[proj.id]
+                  ? "В эксплуатации: рантайм исполняет проект. Нажмите, чтобы вывести"
+                  : "Не в эксплуатации: рантайм проект не исполняет. Нажмите, чтобы ввести"}
+                aria-label={runtimeFlags[proj.id]
+                  ? `Вывести проект «${proj.name}» из эксплуатации`
+                  : `Ввести проект «${proj.name}» в эксплуатацию`}
+              >
+                {runtimeFlags[proj.id] ? <Power size={14} /> : <PowerOff size={14} />}
+              </button>
+              <button
+                type="button"
+                onClick={(e) => handleAutobind(e, proj)}
+                className="ml-2 shrink-0 p-0.5 rounded text-neutral-400 hover:text-indigo-500 hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors"
+                title="Автопривязка к базе каналов"
+                aria-label={`Автопривязка проекта «${proj.name}» к базе каналов`}
+              >
+                <Link2 size={14} />
+              </button>
+              </>}
+              {/* Удалять проект может только администратор. */}
+              {admin && <button
+                type="button"
+                onClick={(e) => void handleDelete(e, proj)}
+                className="ml-2 shrink-0 p-0.5 rounded hover:bg-red-100 dark:hover:bg-red-900/40 text-neutral-400 hover:text-red-500 transition-colors"
+                title="Удалить проект"
+                aria-label={`Удалить проект «${proj.name}»`}
+              >
+                <X size={14} />
+              </button>}
+                </>);
+              })()}
+            </li>
+          ))}
+        </ul>
       )}
 
-      <div className="mt-4 flex items-center gap-2">
+      {/* Создавать проект может только администратор (иначе 403 NOT_ADMIN). */}
+      {admin && <div className="mt-4 flex items-center gap-2">
         <input
           type="text"
           placeholder="Имя нового проекта"
@@ -139,23 +274,18 @@ export function ProjectContent() {
         >
           {isCreating ? "Создание..." : "Создать"}
         </button>
-      </div>
+      </div>}
 
-      <div className="mt-8 flex gap-3 justify-end">
-        <button
-          onClick={closeModal}
-          className="px-5 py-2.5 rounded-lg font-medium bg-gray-100 dark:bg-gray-800 hover:bg-gray-700 border border-gray-300 dark:border-gray-700 hover:border-gray-600 transition-colors"
-        >
-          Отмена
-        </button>
-        <button
+      <ModalFooter>
+        <Button onClick={closeModal}>Отмена</Button>
+        <Button
+          variant="primary"
           onClick={() => void handleConfirm()}
           disabled={projectList.length === 0 || !selectedValue}
-          className="px-6 py-2.5 rounded-lg font-medium bg-linear-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 hover:to-blue-500 text-white shadow-lg shadow-indigo-900/30 transition-all disabled:opacity-40"
         >
           Выбрать
-        </button>
-      </div>
+        </Button>
+      </ModalFooter>
     </>
   );
 }

@@ -2,7 +2,6 @@ import './globals.css';
 import { Geist } from 'next/font/google';
 import Providers from './providers';
 import { ThemeProvider } from 'next-themes';
-import { WebSocketProvider } from '@/providers/WebSocketProvider';
 import React from 'react';
 import { ModalRoot } from '@/components/ui/ModalRoot';
 import { ConfirmRoot } from '@/components/ui/ConfirmModal';
@@ -15,7 +14,7 @@ const geist = Geist({ subsets: ['latin'], variable: '--font-geist-sans' });
  * Корневой layout: только оболочка документа, провайдеры и глобальные стеки окон.
  *
  * Шапка с навигацией переехала в layout группы (app) — здесь она рендерилась
- * безусловно и висела в том числе над /login и /register.
+ * безусловно и висела в том числе над /login.
  */
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -23,12 +22,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
           <Providers>
-            <WebSocketProvider>
-              {children}
-              <ModalRoot />
-              {/* Отдельный стек — подтверждение может открыться поверх обычной модалки. */}
-              <ConfirmRoot />
-            </WebSocketProvider>
+            {children}
+            <ModalRoot />
+            {/* Отдельный стек — подтверждение может открыться поверх обычной модалки. */}
+            <ConfirmRoot />
           </Providers>
         </ThemeProvider>
       </body>

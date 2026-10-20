@@ -12,12 +12,12 @@ import {DiagramElement} from "@/types/editorElement.type";
 import {PropertyRef, TagBinding} from "@/types/binding.types";
 import {
   collectTagScope,
-  hasSavedProperty,
-  hasSavedTagProperty,
+  modernizeScopeCode,
   uniqueVarName,
   withPropertyRefs,
 } from "@/lib/runtime/bindingScope";
 import {compileBinding, executeBinding, type BindingIntent} from "@/lib/runtime/executeBinding";
+import {checkScriptSyntax} from "@/lib/runtime/scriptSyntax";
 import {getRenderedElement} from "@/lib/getRenderedElement";
 import {ChooseObjectPropertyModal, type PickedProperty} from "./OpenChooseObjectPropertyModal";
 
@@ -31,7 +31,7 @@ const buildTemplate = (tagName: string | undefined, stateNames: string[]) => {
   const name = tagName ?? "ИМЯ_ТЕГА";
   const alarm = stateNames.find(s => s !== "Нормальное") ?? "Авария";
   const normal = stateNames.includes("Нормальное") ? "Нормальное" : (stateNames[0] ?? "Нормальное");
-  return `if (${name}.V > 100) {\n  setState("${alarm}")\n} else {\n  setState("${normal}")\n}\n`;
+  return `if (${name} > 100) {\n  setState("${alarm}")\n} else {\n  setState("${normal}")\n}\n`;
 };
 
 type TestResult =
@@ -52,18 +52,23 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
     () => withPropertyRefs(collectTagScope(element.properties), propertyRefs),
     [element.properties, propertyRefs],
   );
-  // Бэкенд требует ссылку на СВОЁ сохранённое свойство при сохранении сцены (иначе
-  // POST всей сцены падает 400). Для биндинга-тега — свойство-тег; для биндинга на
-  // чужие свойства годится любое сохранённое свойство хоста (см. hasSavedProperty).
+  // Биндингу нужно свойство-хозяин: для биндинга-тега — свойство типа «Тег», для
+  // биндинга на чужие свойства годится любое. Сохранённость больше не при чём —
+  // свойство уезжает той же сценой, и бэкенд привязывает биндинг по имени.
   const canSave = useMemo(
     () =>
-      hasSavedTagProperty(element.properties) ||
-      (propertyRefs.length > 0 && hasSavedProperty(element.properties)),
+      (element.properties ?? []).some(p => p.property_type === "Тег") ||
+      (propertyRefs.length > 0 && (element.properties?.length ?? 0) > 0),
     [element.properties, propertyRefs.length],
   );
 
-  const [code, setCode] = useState(
-    binding?.code ?? buildTemplate(scope.names[0], stateNames),
+  // Код старых схем показываем уже в новом синтаксисе («Имя.V» → «Имя»): рантайм всё равно
+  // переводит его при компиляции, и пусть человек видит ровно то, что исполнится, — а при
+  // сохранении привязки перевод осядет на сервере, и переводить будет уже нечего.
+  const [code, setCode] = useState(() =>
+    binding?.code != null
+      ? modernizeScopeCode(binding.code, scope.names)
+      : buildTemplate(scope.names[0], stateNames),
   );
   const [mockValues, setMockValues] = useState<Record<string, string>>({});
   const [testResult, setTestResult] = useState<TestResult>(null);
@@ -89,7 +94,7 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
     const existing = propertyRefs.find(r => r.propertyId === picked.propertyId);
     if (existing) {
       // Свойство уже добавлено — просто вставим его переменную в код.
-      insertAtCursor(`${existing.varName}.V`);
+      insertAtCursor(existing.varName);
       return;
     }
     const taken = new Set<string>([...scope.names, ...propertyRefs.map(r => r.varName)]);
@@ -106,7 +111,7 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
         valueType: picked.valueType,
       },
     ]);
-    insertAtCursor(`${varName}.V`);
+    insertAtCursor(varName);
   };
 
   const removePropertyRef = (propertyId: number) =>
@@ -142,8 +147,12 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
     }
   };
 
+  // Бэкенд отклонит всю сцену со скриптом, который не разбирается (контракт 25.09.2026):
+  // показываем ошибку сразу и не даём сохранить — см. checkScriptSyntax.
+  const syntaxError = useMemo(() => checkScriptSyntax(code), [code]);
+
   const handleSave = () => {
-    if (!name.trim() || !code.trim() || !canSave) return;
+    if (!name.trim() || !code.trim() || !canSave || syntaxError) return;
     const store = useEditorStore.getState();
     if (binding) {
       store.updateBinding(element.key, binding.id, {name: name.trim(), code, propertyRefs});
@@ -179,9 +188,14 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
         description={
           <>
             JavaScript-код исполняется в мониторе при изменении тегов и свойств. В скоупе — свойства-теги
-            элемента и свойства других компонентов сцены (объект <code>{"{V, RAW}"}</code>) и API:{" "}
-            <code>setState(&quot;Имя&quot;)</code>, <code>setProp(&quot;color&quot;, значение)</code>,{" "}
-            <code>self</code>.
+            элемента и свойства других компонентов сцены и API: <code>setState(&quot;Имя&quot;)</code>,{" "}
+            <code>setProp(&quot;color&quot;, значение)</code>, <code>self</code>.
+            <br />
+            <b>Переменная — это само значение</b>: пишите <code>ST &gt; 100</code>, без{" "}
+            <code>.V</code>. Имя переменной — это <b>название свойства</b> со вкладки «Свойства»
+            (переименуете свойство — переименуется и переменная), путь канала в коде не нужен.
+            Значение — число, если строка парсится как число, иначе строка или <code>null</code>;
+            исходная строка — <code>RAW.ST</code>.
           </>
         }
       />
@@ -224,7 +238,7 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
                   key={tagName}
                   className={chipClasses}
                   title={scope.tagIdByName[tagName]}
-                  onClick={() => insertAtCursor(`${tagName}.V`)}
+                  onClick={() => insertAtCursor(tagName)}
                 >
                   <Tag size={12} />
                   {tagName}
@@ -241,7 +255,7 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
               key={ref.propertyId}
               className={cn(chipClasses, "bg-emerald-950/60 text-emerald-300 border-emerald-800/40 hover:bg-emerald-900/70")}
               title={`${ref.componentLabel} · ${ref.propertyName}${ref.valueType ? " · " + ref.valueType : ""}`}
-              onClick={() => insertAtCursor(`${ref.varName}.V`)}
+              onClick={() => insertAtCursor(ref.varName)}
             >
               <Boxes size={12} />
               {ref.varName}
@@ -364,6 +378,12 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
         </Collapsible>
       )}
 
+      {syntaxError && (
+        <div role="alert" className="shrink-0 text-sm text-red-600 dark:text-red-400">
+          Синтаксическая ошибка: {syntaxError}
+        </div>
+      )}
+
       <div className="shrink-0 flex gap-3 justify-end">
         <button
           onClick={closeModal}
@@ -375,8 +395,10 @@ function BindingEditorModalContent({element, binding}: BindingEditorProps) {
         </button>
         <button
           onClick={handleSave}
-          disabled={!name.trim() || !code.trim() || !canSave}
-          title={!canSave ? "У элемента нет сохранённого свойства — см. предупреждение выше" : undefined}
+          disabled={!name.trim() || !code.trim() || !canSave || Boolean(syntaxError)}
+          title={!canSave
+            ? "У элемента нет сохранённого свойства — см. предупреждение выше"
+            : syntaxError ? "Исправьте синтаксическую ошибку в коде" : undefined}
           className="px-6 py-2.5 rounded-lg font-medium
           bg-linear-to-r from-indigo-600 to-blue-600
           hover:from-indigo-500 hover:to-blue-500

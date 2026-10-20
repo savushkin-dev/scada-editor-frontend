@@ -40,34 +40,10 @@ export const GET = protectedRoute(async (req: NextRequest, {token, params}) => {
 
   if (!response.ok) return backendErrorResponse(response);
 
-  const data = await response.json().catch(() => null);
-
-  return NextResponse.json(data);
-});
-
-export const DELETE = protectedRoute(async (req: NextRequest, {token, params}) => {
-  const {id} = params;
-
-  const projectId = parseProjectId(req.nextUrl.searchParams);
-  if (projectId === null) {
-    return NextResponse.json(
-      {error: "Параметр project_id обязателен и должен быть целым числом (int64)"},
-      {status: 400}
-    );
-  }
-
-  const response = await fetch(
-    `${BACKEND_URL}/api/editor/components/scene/${id}?project_id=${projectId}`,
-    {
-      method: 'DELETE',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-    }
-  );
-
-  if (!response.ok) return backendErrorResponse(response);
-
-  return NextResponse.json({success: true});
+  // Тело — как есть, потоком: дерево сцены большое, а разбирать его здесь и собирать
+  // заново ради того же JSON незачем.
+  return new NextResponse(response.body, {
+    status: response.status,
+    headers: {'Content-Type': 'application/json'},
+  });
 });

@@ -1,6 +1,10 @@
-import {snap} from "@/lib/utils";
+import {snap, GRID} from "@/lib/utils";
+import type {MonitorView} from "@/lib/editor/monitorView";
 import {create} from "zustand/react";
-import {GroupElement, DiagramElement, ElementType, LeafElement, SceneType} from "@/types/editorElement.type";
+import {errorTextFromBody} from "@/lib/access/accessErrors";
+import {grantOf} from "@/lib/access/grants";
+import {useSessionUserStore} from "@/store/useSessionUserStore";
+import {GroupElement, ComponentState, DiagramElement, ElementType, LeafElement, SceneType} from "@/types/editorElement.type";
 import {temporal} from "zundo";
 import {
   elementToGroupLocal,
@@ -12,17 +16,46 @@ import {
   resolveParentAbsoluteIndexed,
 } from "@/lib/groupLayout";
 import {ElementIndex, getElementIndex} from "@/lib/editor/elementIndex";
+import {shiftElementPositions} from "@/lib/editor/shiftPositions";
+import {getAbsoluteRenderedPos} from "@/lib/editor/getAbsoluteRenderedPos";
+import {zIndexOf} from "@/lib/editor/zOrder";
+import {isBoundsContributor} from "@/lib/editor/boundsContributor";
+import {
+  isMetaElement, isSameSheet, readSheetFromRaw, resolveSheet, SHEET_MAX, SHEET_MIN,
+} from "@/lib/editor/sheet";
+import {findStateNameRefs, renameStateNameInCode, type StateNameRef} from "@/lib/editor/stateNameRefs";
 import {rootComponentsOf} from "@/lib/editor/documentComponents";
+import {purgePropertyRefs} from "@/lib/editor/propertyDependents";
+import {
+  detachServerBindingIds,
+  detachServerEventIds,
+  detachServerScriptIds,
+  detachServerStateIds,
+} from "@/lib/editor/detachServerIds";
+import {instantiateTemplate} from "@/lib/editor/templateInstance";
 import {buildComponentTree} from "@/lib/buildComponentTree";
 import {elementRegistry} from "@/constants/propertiesPanel";
-import transformElements from "@/lib/transformElements";
+import transformElements, {normalizeProperty} from "@/lib/transformElements";
+import {
+  dropReleaseScenes, dropScene, fetchSceneWithVersion, getCachedScene, prefetchScenes, putScene,
+  releaseVersionOf, SceneLoadError, type SceneSource,
+} from "@/lib/editor/sceneCache";
+import {
+  createRelease, NoProdReleaseError, parseRuntimeInfo, putInOperation, setProdRelease, type CreatedRelease,
+} from "@/lib/editor/releasesApi";
+import {readPinnedTabs} from "@/lib/editor/pinnedScenes";
 import {toast} from "sonner";
 import {PropertyCreateDto, PropertyCreateRequestDto} from "@/types/tags.types";
-import {TagBinding} from "@/types/binding.types";
+import {PropertyRef, TagBinding} from "@/types/binding.types";
+import type {AutobindReport} from "@/types/autobind.types";
 import {createUuid} from "@/lib/createUuid";
 import {normalizeProjectList, toEditorProject, type EditorProject} from "@/lib/pickProjectsFromComponents";
 import {elementBoundsRendered, getElementBoundsRendered} from "@/lib/getElementBounds";
+import {cameraToReveal} from "@/lib/editor/revealCamera";
 import {isConturExport, normalizeConturElements, type ConturImportStats} from "@/lib/editor/conturImport";
+import {DEFAULT_CURVE_POINTS, curvePointsBounds} from "@/lib/editor/curvePoints";
+import {transformSelection, type TransformOp} from "@/lib/editor/transformSelection";
+import {getCanvasPointerWorld, clearCanvasPointerWorld} from "@/lib/editor/canvasPointer";
 import {confirmModal, promptModal} from "@/components/ui/ConfirmModal";
 import {
   fetchCurrentVersion,
@@ -49,9 +82,52 @@ type EditorState = {
   sceneList: {id: number; name: string}[];
   currentProject: EditorProject | null;
   projectList: EditorProject[];
+  /**
+   * Введён ли проект в эксплуатацию (`projectId` → флаг). Рантайм поднимает ТОЛЬКО такие
+   * проекты: у остальных нет ни телеметрии, ни onChange, ни процедур, и монитор получает
+   * 409 на создание сессии.
+   *
+   * Отдельной картой, а не полем `EditorProject`: на бэкенде это отдельная таблица, и в
+   * списке проектов флаг не приходит. Известен не для всех проектов — отсутствие ключа
+   * означает «ещё не спрашивали», а не «выключен».
+   */
+  projectRuntimeFlags: Record<number, boolean>;
+  /** prod-выпуск проекта (`projectId` → номер; null — не назначен). Из того же `…/runtime`. */
+  projectProdVersions: Record<number, number | null>;
+  /**
+   * Откуда берутся схемы: `draft` — черновик (редактор), `release` — prod-выпуск (монитор).
+   * Выставляет страница, а не действие: монитор открывает схемы ещё и из скриптов
+   * (`openSceneFromScript`) и вкладок, и любой обходной путь без флага открыл бы черновик.
+   * См. docs/contract/2026-09-29-project-release-contract.md.
+   */
+  sceneSource: SceneSource;
+  setSceneSource: (source: SceneSource) => void;
+  /** Номер выпуска, который сейчас рисует монитор (`X-Release-Version`, сессия, `TREE_CHANGED`). */
+  releaseVersionNo: number | null;
+  setReleaseVersionNo: (versionNo: number | null) => void;
+  /** Почему монитор не может показать выпуск (проект не в эксплуатации); null — всё в порядке. */
+  releaseError: string | null;
+  /** prod сменился (кадр `TREE_CHANGED`): перечитать список и текущую схему выпуска. */
+  reloadRelease: (versionNo: number) => Promise<void>;
   loadSceneList: (projectId: number) => Promise<{id: number; name: string}[] | void>;
   loadProjectList: () => Promise<EditorProject[] | void>;
+  loadProjectRuntimeFlag: (projectId: number) => Promise<void>;
+  setProjectInOperation: (projectId: number, inOperation: boolean) => Promise<void>;
+  /**
+   * «Выпустить»: снимок СОХРАНЁННОГО черновика проекта. Несохранённую правку открытой схемы
+   * сначала предлагает сохранить — иначе в выпуск ушло бы не то, что видно на холсте.
+   * null — отказ или ошибка (тост уже показан).
+   */
+  releaseProject: (projectId: number, comment: string) => Promise<CreatedRelease | null>;
+  /** «Сделать prod»: работающий проект переключится сам, мониторы получат TREE_CHANGED. */
+  makeProdRelease: (projectId: number, versionNo: number) => Promise<boolean>;
+  /**
+   * Автопривязка проекта к базе каналов. Возвращает отчёт, а не `void` как соседи:
+   * его показывает диалог. Ошибку действие рисует тостом само и отдаёт `null`.
+   */
+  autobindProject: (projectId: number, channelRoot: string) => Promise<AutobindReport | null>;
   createProject: (name: string) => Promise<EditorProject | void>;
+  deleteProject: (id: number) => Promise<void>;
   setCurrentProject: (project: EditorProject | null) => void;
   elements: DiagramElement[];
   selectedIds: string[];
@@ -59,9 +135,23 @@ type EditorState = {
   enterGroup: (key: string) => void;
   exitGroup: () => void;
   /**
+   * Показать элемент: открыть его уровень и выделить. Для панели «Слои» — там можно
+   * ткнуть во вложенный элемент, не входя в группу, а на холсте он был бы недоступен.
+   */
+  revealElement: (key: string) => void;
+  /**
    * Ячейка таблицы, сфокусированная в панели свойств (для показа cell-специфичных
    * полей). Транзиентно, как selectedIds/activeGroupKey — не в elements, вне undo.
    */
+  /**
+   * Режим «Править все состояния»: правка визуала выделенного элемента пишется в
+   * overrides ВСЕХ его состояний, а не только текущего. Нужен для оформления, которое
+   * одинаково во всех состояниях компонента (подпись, рамка): иначе его пришлось бы
+   * повторять в каждом состоянии руками. Транзиентный, как selectedTableCell — не в
+   * elements, значит вне undo (сами правки в undo попадают как обычно).
+   */
+  editAllStates: boolean;
+  setEditAllStates: (value: boolean) => void;
   selectedTableCell: {elementKey: string; row: number; col: number} | null;
   selectTableCell: (elementKey: string, row: number, col: number) => void;
   clearTableCellSelection: () => void;
@@ -105,6 +195,8 @@ type EditorState = {
   clearRuntime: () => void;
   clipboard: DiagramElement[] | null;
   canvasRect: DOMRect | null;
+  /** Размер листа сцены. Читается из elements (`resolveSheet`), тут только запись. */
+  setSheet: (w: number, h: number) => void;
   connecting: {
     fromNode: string;
     fromPort: string;
@@ -116,6 +208,19 @@ type EditorState = {
   setCameraPan: (dx: number, dy: number) => void;
   setCameraZoom: (newZoom: number) => void;
   setCamera: (x: number, y: number, zoom: number) => void;
+  /**
+   * Зафиксировать вид сцены для монитора (замок в панели зума редактора) или снять его
+   * (`null`). Это данные сцены, а не состояние просмотра: вид пишется в служебный элемент
+   * рядом с размером листа, попадает в undo, помечает сцену несохранённой и уезжает на
+   * сервер с сохранением. См. lib/editor/monitorView.ts.
+   */
+  setMonitorView: (view: MonitorView | null) => void;
+  /**
+   * Подвести камеру к элементу, если он вне видимой области (иначе ничего не делает).
+   * Для панели «Слои»: выделение само по себе холст не двигает, и выбранный элемент
+   * мог оказаться далеко за краем экрана.
+   */
+  ensureElementVisible: (key: string) => void;
 
   /**
    * «Вооружённый» инструмент палитры: клик по элементу палитры сохраняет сюда его
@@ -135,6 +240,11 @@ type EditorState = {
   bringToFront: (key: string) => void;
   sendToBack: (key: string) => void;
   /** Выравнивание верхнеуровневых выделенных (≥2) по краю/центру общей рамки. */
+  /**
+   * Поворот на 90° и отражение выделения (в т.ч. групп) — пересчётом геометрии.
+   * Подробности и причина, почему не полем `rotate`, — в transformSelection.ts.
+   */
+  transformSelected: (op: TransformOp) => void;
   alignSelected: (mode: 'left' | 'hcenter' | 'right' | 'top' | 'vcenter' | 'bottom') => void;
   /** Распределение верхнеуровневых выделенных (≥3) с равными зазорами по оси. */
   distributeSelected: (axis: 'h' | 'v') => void;
@@ -149,14 +259,42 @@ type EditorState = {
   clearSelection: () => void;
   addComponentStateToSubtree: (elementKey: string, stateName: string) => string | null;
   removeComponentStateFromSubtree: (elementKey: string, stateName: string) => void;
+  /**
+   * Переименование состояния каскадом по поддереву. `rewriteCode` — заодно переписать
+   * литералы `setState("старое")` в биндингах и обработчиках событий поддерева.
+   */
+  renameComponentStateInSubtree: (
+    elementKey: string,
+    oldName: string,
+    newName: string,
+    opts?: {rewriteCode?: boolean},
+  ) => void;
+  /** Read-only: где в коде поддерева упомянуто имя состояния (для диалога переименования). */
+  findStateUsages: (elementKey: string, stateName: string) => StateNameRef[];
   addElementAt: (x: number, y: number, type: ElementType, extraProps?: Record<string, unknown>) => void;
-  addTags: (payload: PropertyCreateRequestDto) => Promise<void>;
-  editProperty: (propertyId: number, payload: PropertyCreateRequestDto) => Promise<void>;
+  /** Заводит свойство локально; уедет со сценой. false — имя занято. */
+  addProperty: (elementKey: string, payload: PropertyCreateRequestDto) => boolean;
+  /** Правит свойство локально. Переименование заведённого дополнительно уходит точечным
+   *  PUT — только он переносит значения наборов на новое имя. false — отказ. */
+  editProperty: (
+    elementKey: string,
+    target: PropertyCreateDto,
+    payload: PropertyCreateRequestDto,
+  ) => Promise<boolean>;
+  /** Удаляет свойство локально + убирает ссылки на него по сцене. */
+  deleteProperty: (elementKey: string, target: PropertyCreateDto) => void;
   /** CRUD биндингов (JS-скрипты монитора) — design-time правки, попадают в undo. */
   addBinding: (elementKey: string, binding: TagBinding) => void;
   updateBinding: (elementKey: string, bindingId: string, patch: Partial<Omit<TagBinding, "v" | "id">>) => void;
   removeBinding: (elementKey: string, bindingId: string) => void;
   addTemplate: (screenX: number, screenY: number, template: DiagramElement[]) => void;
+  /**
+   * Кладёт готовые элементы на холст ОДНИМ действием — один шаг undo на весь импорт.
+   *
+   * Отдельно от `importElementsFromJson`: тот назначает ключи заново, но `propertyRefs`
+   * внутри биндингов не перекладывает, и у готовых копий ссылки на соседей протухли бы.
+   */
+  addImportedElements: (elements: DiagramElement[], mode: "append" | "replace") => void;
   deleteSelectedElement: () => void;
   copySelectedElement: () => void;
   pasteSelectedElement: () => void;
@@ -210,6 +348,12 @@ type EditorState = {
    * а разбираться будет ручное сохранение, у которого есть слияние.
    */
   staleBaseVersion: number | null;
+  /**
+   * Почему не прошло последнее АВТОСОХРАНЕНИЕ (текст бэкенда), `null` — прошло или не
+   * запускалось. Нужен, чтобы ошибка, которая повторяется каждый такт (синтаксис скрипта,
+   * контракт 25.09.2026), показывалась тостом один раз, а дальше висела плашкой.
+   */
+  autosaveError: string | null;
   /** Режим просмотра старой версии: холст только для чтения, правки спрятаны. */
   versionPreview: VersionPreview | null;
 
@@ -236,9 +380,15 @@ type EditorState = {
    * `mode: "replace"` кладёт на холст только импортированное — иначе повторный импорт того
    * же листа удвоит схему. Возвращает разбивку по типам для выгрузки CONTUR либо `null`.
    */
+  /**
+   * Сцена как переносимый JSON-файл: конверт с плоским массивом элементов в том же
+   * формате, который принимает импорт (см. docs/contur/IMPORT_SCHEME_SPEC.md).
+   */
+  buildSceneExport: () => SceneExportFile;
   importElementsFromJson: (
     rawElements: Record<string, unknown>[],
-    opts?: {mode?: "append" | "replace"},
+    /** `native` — файл нашего экспорта: нормализатор чужого диалекта не запускается. */
+    opts?: {mode?: "append" | "replace"; native?: boolean},
   ) => ConturImportStats | null;
   /**
    * `keepHistory` — не чистить стек undo. Нужен только для перезагрузки ТОЙ ЖЕ сцены
@@ -285,29 +435,30 @@ const isPatchEffective = (
 ): boolean => Object.entries(patch).some(([k, v]) => !isSameValue(target[k], v));
 
 /**
- * Сдвигает все позиционные поля (x, y, x1, y1, x2, y2) объекта на dx/dy.
- * Позиция элемента может лежать как в базовых полях, так и в overrides состояния
- * (перемещённые листья), а у линий — в x1/y1/x2/y2. Поэтому сдвигаем везде, где есть.
+ * Ключи, которые всегда живут в БАЗЕ элемента, а не в overrides состояния.
+ *
+ * `zIndex` — порядок слоя, свойство самого элемента, а не его вида в конкретном
+ * состоянии: сортировка выполняется там, где активного состояния не видно (корни
+ * в Canvas, состав контейнера в GroupNode). Держать слой в overrides значило бы
+ * ещё и завязать порядок отрисовки на переключение состояний.
+ *
+ * `monitorMenu` — ширина, шрифт и высота пунктов контекстного меню в мониторе:
+ * настройка компонента, а не его вида, и меню одинаково в любом состоянии.
+ *
+ * `trend` — окно, шаг и оформление перьев тренда: та же настройка элемента.
  */
-const shiftPositionKeys = (obj: Record<string, unknown>, dx: number, dy: number): Record<string, unknown> => {
-  const o = {...obj};
-  for (const k of ['x', 'x1', 'x2'] as const) {
-    if (typeof o[k] === 'number') o[k] = (o[k] as number) + dx;
-  }
-  for (const k of ['y', 'y1', 'y2'] as const) {
-    if (typeof o[k] === 'number') o[k] = (o[k] as number) + dy;
-  }
-  return o;
-};
+const BASE_ONLY_KEYS = new Set(["zIndex", "monitorMenu", "trend"]);
 
-/** Сдвигает элемент на dx/dy: базовые поля + позиционные ключи в overrides всех состояний. */
-const shiftElementPositions = (el: DiagramElement, dx: number, dy: number): DiagramElement => {
-  const shifted = shiftPositionKeys(el as unknown as Record<string, unknown>, dx, dy) as unknown as DiagramElement;
-  shifted.states = (el.states ?? []).map(s => ({
-    ...s,
-    overrides: shiftPositionKeys(s.overrides ?? {}, dx, dy),
-  }));
-  return shifted;
+/** Делит патч на часть «в базу» и часть «в overrides состояния». */
+const splitBaseOnly = (
+  patch: Record<string, unknown>,
+): { base: Record<string, unknown>; state: Record<string, unknown> } => {
+  const base: Record<string, unknown> = {};
+  const state: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(patch)) {
+    (BASE_ONLY_KEYS.has(k) ? base : state)[k] = v;
+  }
+  return {base, state};
 };
 
 /**
@@ -347,61 +498,73 @@ const applyShifts = (
 };
 
 /**
+ * Проставляет номера свойств тем ссылкам, что их ждали.
+ *
+ * Ссылка на свойство соседа адресует его парой «`componentKey` + `propertyName`», а
+ * маршрутизирует рантайм по `propertyId`. Номера у свойства нет, пока сцена не сохранена
+ * (свойства заводятся вместе с ней), и ссылка, созданная до первого сохранения, приходит
+ * без него. Здесь она его и получает — из дерева, вернувшегося в ответе сохранения.
+ *
+ * Ссылка без номера появляется и у экземпляра шаблона: `addTemplate` снимает чужие
+ * номера, оставляя ту же пару.
+ */
+const resolvePendingPropertyRefs = (elements: DiagramElement[]): DiagramElement[] => {
+  const {byKey} = getElementIndex(elements);
+
+  const idOf = (componentKey: string, propertyName: string): number | undefined =>
+    (byKey[componentKey]?.properties ?? [])
+      .find(p => p.name === propertyName && typeof p.id === "number")?.id;
+
+  const fill = <T extends {propertyRefs?: PropertyRef[]}>(owner: T): T => {
+    const refs = owner.propertyRefs;
+    if (!refs?.length) return owner;
+    let changed = false;
+    const next = refs.map(ref => {
+      if (ref.propertyId != null) return ref;
+      const id = idOf(ref.componentKey, ref.propertyName);
+      if (id == null) return ref;
+      changed = true;
+      return {...ref, propertyId: id};
+    });
+    return changed ? {...owner, propertyRefs: next} : owner;
+  };
+
+  let touched = false;
+  const next = elements.map(el => {
+    let changed = false;
+    const bindings = (el.bindings ?? []).map(b => {
+      const filled = fill(b);
+      if (filled !== b) changed = true;
+      return filled;
+    });
+    const events = (el.events ?? []).map(e => {
+      if (!e.handler) return e;
+      const filled = fill(e.handler);
+      if (filled === e.handler) return e;
+      changed = true;
+      return {...e, handler: filled};
+    });
+    if (!changed) return el;
+    touched = true;
+    return {...el, bindings, ...(el.events ? {events} : {})} as DiagramElement;
+  });
+
+  // Ссылку на массив сохраняем, если ничего не изменилось: по ней завязаны equality
+  // истории undo и флаг несохранённых правок.
+  return touched ? next : elements;
+};
+
+/**
  * Клонирует набор элементов (с потомками) с ремапом ключей и смещением корней
  * вправо-вниз. Корни клона реparent'ятся в корень сцены. Общая база для
  * вставки (Ctrl+V) и дублирования (Ctrl+D).
  */
-/**
- * Снимает серверные id вложенных сущностей с копии элемента.
- *
- * `serverId` адресует КОНКРЕТНУЮ сущность на бэкенде. У копии (вставка, дублирование,
- * установка шаблона на холст) сущность новая — с `id: null`, — и отправить вместе с ней
- * чужой id состояния, скрипта, биндинга или события значит сказать серверу «это
- * состояние переехало сюда»: оригинал своё потеряет, а слияние выдаст конфликт на
- * ровном месте. Локальные `id` (React-ключи) при этом сохраняются.
- *
- * Свойства (`properties`) снять нельзя: у `PropertyCreateDto` поле `id` обязательное
- * (number), они заводятся отдельным REST-путём `/api/editor/tags` и обнуление потребует
- * правки того контракта.
- */
-const detachServerStateIds = (states: DiagramElement["states"] | undefined): DiagramElement["states"] =>
-  (states ?? []).map(state => {
-    if (state.serverId == null) return state;
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const {serverId: _serverId, ...rest} = state;
-    return rest;
-  });
-
-/** Скрипты копии: новый локальный uuid + снятый серверный id. */
-const detachServerScriptIds = (
-  scripts: DiagramElement["scripts"] | undefined,
-): DiagramElement["scripts"] =>
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  (Array.isArray(scripts) ? scripts : []).map(({serverId: _serverId, ...s}) => ({
-    ...s,
-    id: createUuid(),
-  }));
-
-/** Биндинги копии: без серверного id и без пары «свойство», присвоенной сервером. */
-const detachServerBindingIds = (
-  bindings: DiagramElement["bindings"] | undefined,
-): DiagramElement["bindings"] =>
-  (Array.isArray(bindings) ? bindings : []).map(
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    ({serverId: _s, componentPropertyId: _pid, componentPropertyName: _pname, ...b}) => b,
-  );
-
-/** События копии: без серверного id (сопоставление всё равно по `event_type`). */
-const detachServerEventIds = (
-  events: DiagramElement["events"] | undefined,
-): DiagramElement["events"] =>
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  (Array.isArray(events) ? events : []).map(({serverId: _serverId, ...e}) => e);
-
 const cloneElementsWithOffset = (
   source: DiagramElement[],
   scene: SceneType | null,
-  offset = 60,
+  /** Смещение корней. Вектор, а не одно число: вставка «под курсор» двигает набор
+   *  по X и Y на разную величину. */
+  offset: {dx: number; dy: number} = {dx: 60, dy: 60},
 ): {newElements: DiagramElement[]; newRootKeys: string[]} => {
   // Новые уникальные ключи для каждого элемента набора
   const keyMap: Record<string, string> = {};
@@ -438,7 +601,7 @@ const cloneElementsWithOffset = (
     // сдвигаются все позиционные поля — см. shiftElementPositions.
     if (!isRoot) return remapped;
 
-    return shiftElementPositions(remapped, offset, offset);
+    return shiftElementPositions(remapped, offset.dx, offset.dy);
   });
 
   const newRootKeys = newElements
@@ -505,8 +668,14 @@ const sceneBelongsToCurrentProject = (
  * снизу вверх, чтобы рамки групп всегда облегали своё содержимое.
  * Компенсирует сдвиг origin группы в локальных координатах детей, чтобы не
  * было визуального прыжка при расширении рамки в сторону верхнего-левого угла.
+ *
+ * Отступ здесь ОДИН и тот же, что при создании группы (`GROUP_PADDING`, сейчас 0 —
+ * рамка по контуру членов). Раньше пересчёт добавлял сверху ещё 20
+ * (`RECOMPUTE_EXTRA_PADDING`): группа создавалась с одним полем, а после первого же
+ * сдвига ребёнка рамка навсегда прыгала на 20 наружу с каждой стороны. Компенсация
+ * сдвига origin, которую обещал тот отступ, на самом деле сделана отдельно и честно —
+ * циклом встречного сдвига детей ниже.
  */
-const RECOMPUTE_EXTRA_PADDING = 20; // extra on top of GROUP_PADDING
 
 /**
  * Пересчитывает рамки групп-предков после перемещения элементов.
@@ -524,7 +693,7 @@ const recomputeAncestorBounds = (
   sceneId: number | null | undefined,
 ): DiagramElement[] => {
   const sceneIdStr = String(sceneId ?? "");
-  const totalPadding = GROUP_PADDING + RECOMPUTE_EXTRA_PADDING;
+  const totalPadding = GROUP_PADDING;
 
   const index = getElementIndex(elements);
 
@@ -586,6 +755,11 @@ const recomputeAncestorBounds = (
     for (const childKey of childKeys) {
       const child = workIndex.byKey[childKey];
       if (!child) continue;
+      // Рамка облегает то, что ВИДНО. Скрытый элемент рендер пропускает
+      // (`CanvasNode`), но `getElementBounds` про `visible` не знает вовсе — так
+      // служебный элемент импорта CONTUR (`contur_meta`, visible: false, габарит 0)
+      // молча растягивал рамку до начала координат.
+      if (!isBoundsContributor(child, workIndex)) continue;
       const b = elementBoundsRendered(child, workIndex);
       if (b.minX < minX) minX = b.minX;
       if (b.minY < minY) minY = b.minY;
@@ -593,6 +767,7 @@ const recomputeAncestorBounds = (
       if (b.maxY > maxY) maxY = b.maxY;
     }
 
+    // Ни одного видимого члена — облегать нечего, рамку оставляем как есть.
     if (!isFinite(minX)) continue;
 
     const parentAbs = resolveParentAbsoluteIndexed(group.parentKey, workIndex, sceneId);
@@ -734,22 +909,106 @@ const ensureStateByName = (element: DiagramElement, stateName: string, forcedId?
   } as DiagramElement;
 };
 
+/**
+ * Выдаёт членам контейнера все его состояния (сопоставление по ИМЕНИ).
+ *
+ * Набор состояний задаёт контейнер: имя — это то, по чему `cascadeStateByName`,
+ * `buildShapeDescriptor` и бэкенд связывают родителя с потомками. Примитив, попавший в
+ * компонент с четырьмя состояниями, имел ровно одно («Нормальное»): на холсте он падал
+ * на своё состояние по умолчанию и выглядел правильно, но панель «Состояния» показывала
+ * одно против четырёх — и это читается как «в других состояниях элемента нет».
+ *
+ * Обратного не делаем: контейнер состояния члена НЕ перенимает. `ensureStateByName`
+ * идемпотентен, так что вызов на смешанном составе только заполняет пробелы.
+ */
+const syncMemberStates = (
+  elements: DiagramElement[],
+  containerKey: string,
+  memberKeys: Iterable<string>,
+): DiagramElement[] => {
+  const {byKey} = getElementIndex(elements);
+  const container = byKey[containerKey];
+  if (!container) return elements;
+
+  const names = container.states.map(s => s.name);
+  if (!names.length) return elements;
+
+  // Состояния нужны и вложенным потомкам: состав компонента может быть многоуровневым.
+  const keys = new Set<string>();
+  for (const key of memberKeys) {
+    keys.add(key);
+    for (const descendant of getDescendantKeys(key, elements)) keys.add(descendant);
+  }
+  if (!keys.size) return elements;
+
+  let changed = false;
+  const next = elements.map(el => {
+    if (!keys.has(el.key)) return el;
+    let updated = el;
+    for (const name of names) updated = ensureStateByName(updated, name);
+    if (updated !== el) changed = true;
+    return updated;
+  });
+
+  // Холостая правка не должна плодить новый массив: на его ссылке завязаны equality
+  // истории undo и флаг несохранённых изменений.
+  return changed ? next : elements;
+};
+
 const getErrorMessage = (err: unknown, fallback: string) =>
   err instanceof Error ? err.message : fallback;
 
 /**
  * Бэкенд отдаёт ошибки JSON-телом `{status, message, error, timestamp}`
- * (Spring `ErrorResponse`). Достаём `message` — иначе тост показывает
- * пользователю сырой JSON-блоб, который легко принять за «ничего не произошло».
+ * (Spring `ErrorResponse`), а отказы в доступе — `{error: "FORBIDDEN", reason}`.
+ * Достаём человеческий текст — иначе тост показывает сырой JSON-блоб.
  */
-const parseBackendErrorMessage = (status: number, text: string): string => {
-  try {
-    const parsed = JSON.parse(text);
-    if (typeof parsed?.message === "string" && parsed.message) return parsed.message;
-  } catch {
-    // тело не JSON — покажем как есть (обрезано)
+const parseBackendErrorMessage = errorTextFromBody;
+
+/**
+ * Есть ли у пользователя право правки текущего проекта (`access.edit` из списка проектов,
+ * администратору — всегда). С одним «просмотром» редактор открывается и правится
+ * локально, но всё, что пишет на сервер, должно молча (автосейв) или с пояснением
+ * (ручные действия) остановиться здесь — бэкенд ответил бы 403 NO_EDIT.
+ */
+export const canWriteCurrentProject = (): boolean => {
+  const {currentProject, projectList} = useEditorStore.getState();
+  if (!currentProject) return false;
+  const fromList = projectList.find(p => p.id === currentProject.id);
+  return grantOf(fromList ?? currentProject, useSessionUserStore.getState().admin).edit;
+};
+
+/** Ручное действие в режиме просмотра: объяснить, почему ничего не произошло. */
+const refuseViewOnly = (): false => {
+  toast.info("Только просмотр — сохранение недоступно");
+  return false;
+};
+
+/**
+ * Массовое удаление документов и компонентов — единственный оставшийся адрес удаления.
+ *
+ * Поштучных `DELETE /api/editor/components/{id}` и `.../components/scene/{id}` на бэкенде
+ * больше нет (они отвечали 500). Теперь это конверт `{ids, based_on_version}` на
+ * `DELETE /api/editor/components` (§1 контракта версий).
+ *
+ * `based_on_version` уходит ТОЛЬКО когда номер реально известен: у сцены без единой
+ * версии это поле — 400 (то же правило, что у сохранения). `DELETE` версию сверяет, но не
+ * сливает: расхождение — безусловный 409.
+ */
+const deleteComponentsRequest = async (ids: number[], basedOnVersion?: number | null) => {
+  const res = await fetch('/api/editor/components', {
+    method: 'DELETE',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      ids,
+      ...(typeof basedOnVersion === 'number' ? {based_on_version: basedOnVersion} : {}),
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(parseBackendErrorMessage(res.status, text));
   }
-  return `Ошибка ${status}${text ? `: ${text.slice(0, 200)}` : ""}`;
 };
 
 /**
@@ -781,33 +1040,38 @@ let saveInFlight: Promise<boolean> | null = null;
  */
 let documentGeneration = 0;
 
-/**
- * Очередь точечных правок свойств (`/api/editor/tags`, §8 контракта версий).
- *
- * С 17.08.2026 каждая такая правка проверяется гардом версии и оставляет снимок в
- * истории сцены, то есть ДВИГАЕТ номер версии. Номера в ответе этих эндпоинтов нет
- * (задача `scada-6e1`), поэтому новую базу приходится перечитывать из истории.
- *
- * Отсюда обязательная сериализация: перетаскивание строки в панели свойств шлёт
- * `editProperty` на каждую сдвинутую строку разом. Параллельно они ушли бы с одним и
- * тем же `based_on_version`, первая сдвинула бы версию, а все остальные получили бы
- * `409` — половина перестановки молча не сохранилась бы.
- */
-let propertyWriteChain: Promise<unknown> = Promise.resolve();
+/** Метка нашего формата файла схемы — по ней импорт отличает свой файл от чужой выгрузки. */
+export const SCENE_EXPORT_FORMAT = "SCADA_EDITOR_SCENE";
 
-const queuePropertyWrite = <T,>(task: () => Promise<T>): Promise<T> => {
-  // then(task, task) — предыдущая неудача не должна отменять следующую правку.
-  const run = propertyWriteChain.then(task, task);
-  propertyWriteChain = run.catch(() => undefined);
-  return run;
-};
+/** Файл экспорта схемы: конверт с метаданными и плоским массивом элементов. */
+export interface SceneExportFile {
+  format: typeof SCENE_EXPORT_FORMAT;
+  version: number;
+  exported_at: string;
+  scene: {name: string | null};
+  elements: Record<string, unknown>[];
+}
 
 /**
  * Сколько раз вставляли текущий буфер обмена. Смещение копии считается как
  * `60 * pasteCount`, иначе повторный Ctrl+V кладёт копию точно на предыдущую.
  * Сбрасывается при копировании и при смене сцены/проекта.
+ *
+ * Запасной путь: работает, когда курсор ни разу не был над холстом и вставлять «сюда»
+ * попросту некуда (см. `pasteSelectedElement`).
  */
 let pasteCount = 0;
+
+/**
+ * Точка последней вставки под курсор и счётчик вставок в неё же.
+ *
+ * Вставка идёт туда, где стоит мышь, но если жать Ctrl+V не двигая её, копии легли бы
+ * ровно друг на друга и выглядело бы это как «ничего не произошло» — ровно та жалоба,
+ * ради которой когда-то завели `pasteCount`. Поэтому вторая и следующие вставки в ту же
+ * точку сдвигаются лесенкой по клетке.
+ */
+let lastPastePoint: {x: number; y: number} | null = null;
+let stackedPastes = 0;
 
 /**
  * Снимок `elements` на момент последнего успешного сохранения/загрузки.
@@ -816,6 +1080,28 @@ let pasteCount = 0;
  * пан/зум/выделение — нет (тот же принцип, что у `equality` для zundo).
  */
 let savedElementsSnapshot: DiagramElement[] | null = null;
+
+/**
+ * Документ редактора, отложенный на время работы монитора.
+ *
+ * Редактор и монитор — один стор, а монитор рисует prod-выпуск, не черновик. Без стеша вход
+ * в монитор затёр бы несохранённые правки инженера, а возврат показал бы в редакторе выпуск
+ * как черновик — и первое же сохранение записало бы его поверх черновика. При возврате
+ * документ кладётся на место целиком, если проект тот же; сменили проект в мониторе — стеш
+ * отбрасывается (смена проекта и в редакторе сбрасывает документ).
+ */
+let draftStash: {
+  projectId: number | null;
+  scene: SceneType | null;
+  sceneList: {id: number; name: string}[];
+  elements: DiagramElement[];
+  selectedIds: string[];
+  activeGroupKey: string | null;
+  currentComponentStateByElementKey: Record<string, string>;
+  isDirty: boolean;
+  sceneVersion: number | null;
+  savedSnapshot: DiagramElement[] | null;
+} | null = null;
 
 /**
  * Живое состояние редактора, отложенное на время просмотра старой версии.
@@ -862,10 +1148,140 @@ const applyServerComponents = (
     selectedIds: [],
     activeGroupKey: null,
     selectedTableCell: null,
+    editAllStates: false,
     currentComponentStateByElementKey: {},
+    // Рантайм-оверрайды принадлежат ПРЕДЫДУЩЕМУ документу и обнуляются по той же причине,
+    // что и состояния строкой выше. Ключи элементов переживают серверный круг (см.
+    // transformElements), поэтому `setProp` прошлого визита на схему иначе лёг бы поверх
+    // заново загруженной (в getRenderedElement рантайм применяется последним), а записи по
+    // ключам других схем копились бы в карте всю сессию.
+    //
+    // Не через `clearRuntime()`: тот сбрасывает ещё и ручные значения оператора, а они
+    // привязаны к сессии, а не к схеме, и от переключения слетать не должны. Актуальные
+    // значения движок пересчитает сразу после смены elements — он прогоняет биндинги по
+    // уже известным значениям (см. useRuntimeEngine, эффект на index).
+    runtimeOverridesByElementKey: {},
   });
 
   return elements;
+};
+
+/** Номер последнего вызова `loadScene` — см. проверку устаревших ответов там. */
+let sceneLoadSeq = 0;
+
+/**
+ * Кладёт на холст сцену, полученную целиком (из сети или из кэша сцен).
+ *
+ * `version` — номер версии ИМЕННО этого документа: он станет `based_on_version`
+ * следующего сохранения. `null` — версий нет (или номер не узнали).
+ * false — сцена не из текущего проекта, холст очищен.
+ */
+const applyLoadedScene = (scene: Record<string, unknown>, version: number | null): boolean => {
+  const {currentProject} = useEditorStore.getState();
+  // Иерархия: сцена обязана принадлежать выбранному проекту.
+  if (!sceneBelongsToCurrentProject(scene as unknown as SceneType, currentProject)) {
+    toast.error("Сцена не принадлежит выбранному проекту");
+    useEditorStore.setState({scene: null, elements: [], selectedIds: [], activeGroupKey: null, selectedTableCell: null, currentComponentStateByElementKey: {}});
+    return false;
+  }
+
+  useEditorStore.setState({scene: scene as unknown as SceneType});
+  applyServerComponents((scene?.children as unknown[]) ?? [], scene as {id?: number | string});
+  // Только что загруженная сцена не считается изменённой.
+  // persisted=false: время последнего сейва загрузкой не обновляем.
+  markSceneSaved(false);
+  // Версии прошлой сцены к этой не относятся — сбрасываем всё разом.
+  useEditorStore.setState({
+    sceneVersion: version, versions: [], versionsExhausted: false,
+    saveConflict: null, staleBaseVersion: null, autosaveError: null,
+  });
+  return true;
+};
+
+/**
+ * Проверка свежести схемы, показанной из кэша.
+ *
+ * Номер версии совпал — показано актуальное, ничего не делаем (обычный случай: один
+ * лёгкий запрос вместо сборки всего дерева). Не совпал — перечитываем схему и тихо
+ * подменяем, но только если пользователь её ещё не тронул. Если тронул — не подменяем:
+ * `sceneVersion` остаётся номером показанного документа, и сохранение пойдёт обычным
+ * путём конфликта (ручное — диалог слияния, автосохранение — баннер). Своей логики
+ * слияния здесь нет и быть не должно.
+ */
+const revalidateCachedScene = async (
+  projectId: number,
+  sceneId: number,
+  shownVersion: number | null,
+  generation: number,
+): Promise<void> => {
+  try {
+    const latest = await fetchCurrentVersion("scenes", sceneId);
+    if (latest === shownVersion) return;
+
+    const {scene, version} = await fetchSceneWithVersion(projectId, sceneId, {fresh: true});
+    const s = useEditorStore.getState();
+    if (
+      documentGeneration !== generation
+      || s.scene?.id !== sceneId
+      || s.currentProject?.id !== projectId
+      || s.isDirty
+      || s.versionPreview
+    ) return;
+
+    applyLoadedScene(scene, version ?? null);
+    if (version === undefined) void s.refreshSceneVersion();
+    // Шагов undo у нетронутой схемы нет, но подмена документа — граница истории.
+    useEditorStore.temporal.getState().clear();
+  } catch (err) {
+    // Молча: показанная схема остаётся, а сохранение всё равно сверит версию.
+    console.warn("[scene-cache] не удалось проверить свежесть схемы:", err);
+  }
+};
+
+/**
+ * Фоновая загрузка всех схем проекта в кэш — чтобы быстрым был и ПЕРВЫЙ переход.
+ *
+ * Отложена до простоя браузера: сначала должна спокойно загрузиться схема, которую
+ * открывают прямо сейчас. Закреплённые схемы (вкладки) — первыми в очереди, на них
+ * переходят чаще всего. Сменили проект — очередь старого останавливается.
+ */
+const scheduleScenePrefetch = (projectId: number, list: {id: number}[], source: SceneSource) => {
+  if (typeof window === "undefined") return;
+
+  // Сменили проект или источник (ушли из монитора в редактор) — очередь больше не нужна.
+  const relevant = () => {
+    const s = useEditorStore.getState();
+    return s.currentProject?.id === projectId && s.sceneSource === source;
+  };
+  const run = () => {
+    if (!relevant()) return;
+    const pinned = readPinnedTabs(projectId).pins.map(p => p.id);
+    const ids = [...new Set([...pinned, ...list.map(s => s.id)])]
+      .filter(id => list.some(s => s.id === id));
+    void prefetchScenes(projectId, ids, relevant, source);
+  };
+
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(run, {timeout: 2000});
+  } else {
+    setTimeout(run, 500);
+  }
+};
+
+/**
+ * Время перехода на схему — только в разработке: чтобы было видно, куда уходят секунды
+ * (сеть, распаковка или отрисовка холста). Отрисовку меряем до второго кадра — первый
+ * лишь планирует рендер Konva.
+ */
+const logSceneTiming = (sceneId: number, source: string, startedAt: number, applyAt: number) => {
+  if (process.env.NODE_ENV === "production" || typeof requestAnimationFrame === "undefined") return;
+  const appliedAt = performance.now();
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    console.info(
+      `[scene] ${sceneId} (${source}): загрузка ${Math.round(applyAt - startedAt)} мс, `
+      + `распаковка ${Math.round(appliedAt - applyAt)} мс, отрисовка ${Math.round(performance.now() - appliedAt)} мс`,
+    );
+  }));
 };
 
 /**
@@ -975,65 +1391,110 @@ const discardVersionPreview = () => {
  * предупреждение — молча потеряв работу, которая никуда не делась.
  */
 export const hasUnsavedWork = (): boolean => {
-  const {isDirty, versionPreview} = useEditorStore.getState();
+  const {isDirty, versionPreview, sceneSource} = useEditorStore.getState();
+  // В мониторе на холсте выпуск; правки инженера лежат в стеше черновика.
+  if (sceneSource === "release") return draftStash?.isDirty ?? false;
   return versionPreview ? (versionPreviewStash?.isDirty ?? false) : isDirty;
 };
 
-/**
- * Поле `based_on_version` для точечных правок свойств (§8 контракта версий).
- *
- * Версий у сцены ещё нет — поле не отправляем вовсе. Правило то же, что у сохранения
- * сцены: номер обязателен только там, где история уже существует, а присланный номер
- * при её отсутствии — 400.
- */
-const propertyVersionField = (): {based_on_version?: number} => {
-  const version = useEditorStore.getState().sceneVersion;
-  return version != null ? {based_on_version: version} : {};
-};
-
-/**
- * Разбирает неуспешный ответ точечной правки свойства.
- *
- * 409 здесь означает не то же, что при сохранении сцены: слияния у эндпоинтов свойств
- * нет — расхождение версии для них безусловный отказ. Поэтому диалог сравнения не
- * открываем (сравнивать нечего, сервер списка расхождений не присылает), а показываем
- * плашку устаревшей базы — тем же полем, что и автосохранение, — и подтягиваем
- * актуальный номер версии, чтобы повтор действия прошёл без ручной перезагрузки схемы.
- */
-const propertyWriteError = async (res: Response, fallback: string): Promise<Error> => {
-  const text = await res.text().catch(() => "");
-
-  if (res.status === 409) {
-    let current: number | null = null;
-    try {
-      const body = JSON.parse(text);
-      if (isSaveConflictBody(body)) current = body.current_version ?? null;
-    } catch {
-      // не JSON — номер не узнаем, плашку покажем без него
-    }
-    useEditorStore.setState({staleBaseVersion: current});
-    void useEditorStore.getState().refreshSceneVersion();
-
-    return new Error("Схему успел изменить кто-то другой — правка свойства отклонена. Обновите схему и повторите.");
-  }
-
-  return new Error(`${fallback}: ${text || `ошибка ${res.status}`}`);
-};
-
-/**
- * Подхватывает версию сцены, созданную точечной правкой свойства (§8).
- *
- * Номера версии в ответе этих эндпоинтов нет, а «прошлый + 1» неверен: при совпадении
- * содержимого сервер новую версию не заводит. Поэтому спрашиваем историю. Без этого
- * `sceneVersion` остаётся на версии до правки, и следующее сохранение сцены уходит с
- * устаревшей базой — то есть штатно получает 409 на ровном месте.
- */
-const syncSceneVersionAfterPropertyWrite = async () => {
-  await useEditorStore.getState().refreshSceneVersion();
-  if (useEditorStore.getState().versions.length) void useEditorStore.getState().loadVersions();
-};
-
 /** Фиксирует текущее состояние как сохранённое: снимает флаг «грязно». */
+/**
+ * Переименование свойства на сервере — единственный оставшийся точечный запрос.
+ *
+ * Заведён ради рецептов: их значения ключевались ИМЕНЕМ строки, и перенести их на новое
+ * имя мог только `PUT /api/editor/properties/{id}` (через наш прокси `/api/editor/tags/{id}`).
+ * С 09.09.2026 рецепт — процедура над ТЕГАМИ, о свойствах компонента он не знает, и той
+ * причины не осталось. Запрос сохранён: чем ещё занят этот эндпоинт, с фронта не видно.
+ *
+ * `ok: false` — сервер отказал: тогда локальное переименование не применяем, иначе имя
+ * разъедется с тем, что знает бэкенд.
+ *
+ * Правка свойства записывает на сервере НОВУЮ ВЕРСИЮ сцены и возвращает её номер
+ * (`version_no`, scada-r9lr). Раньше тело выбрасывалось, и сцена на сервере уходила на
+ * N+1, пока стор считал её N: ручное сохранение шло через лишнее слияние, а
+ * автосохранение получало 409. Что с номером делать — решает adoptPropertyEditVersion.
+ */
+const renamePropertyOnServer = async (
+  propertyId: number,
+  payload: PropertyCreateRequestDto,
+): Promise<{ok: false} | {ok: true; versionNo: number | null}> => {
+  try {
+    const res = await fetch(`/api/editor/tags/${propertyId}`, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(parseBackendErrorMessage(res.status, text));
+    }
+    const body = await res.json().catch(() => null);
+    return {ok: true, versionNo: typeof body?.version_no === "number" ? body.version_no : null};
+  } catch (err) {
+    console.error(err);
+    toast.error(getErrorMessage(err, "Не удалось переименовать свойство"));
+    return {ok: false};
+  }
+};
+
+/**
+ * Номер версии сцены после точечной правки свойства на сервере.
+ *
+ * Номер из ответа — база только если он продолжает НАШУ: равен `sceneVersion` (сервер
+ * ничего не записал, содержимое не изменилось) или больше ровно на один (записал нашу
+ * правку). Любой другой номер значит, что между нашей загрузкой и правкой сцену сохранил
+ * кто-то ещё. Принять его базой — значит, что следующее сохранение уйдёт в обход слияния
+ * и молча затрёт чужую работу. Поэтому база остаётся прежней, а расхождение показываем
+ * той же плашкой, что и 409 автосохранения: ручное сохранение сведёт правки.
+ *
+ * Документ на сервере изменился при любом исходе, так что запись кэша сцен сбрасываем.
+ * Пока летел запрос, могли открыть другую схему (или заменить документ) — тогда номер
+ * относится не к ней и в стор не пишется.
+ */
+const adoptPropertyEditVersion = (
+  projectId: number | undefined,
+  sceneId: number | string | undefined,
+  generation: number,
+  versionNo: number | null,
+) => {
+  if (projectId != null && sceneId != null) dropScene(projectId, sceneId);
+
+  const s = useEditorStore.getState();
+  if (documentGeneration !== generation || s.scene?.id !== sceneId) return;
+  if (versionNo == null) return;
+
+  const base = s.sceneVersion;
+  // Базы нет (номер так и не узнали) — сверять не с чем, оставляем как было.
+  if (base == null) return;
+
+  if (versionNo === base || versionNo === base + 1) {
+    useEditorStore.setState({sceneVersion: versionNo});
+  } else {
+    useEditorStore.setState({staleBaseVersion: versionNo});
+  }
+};
+
+/**
+ * Свойства, которые бэкенд не примет: у него `name` и `value_type` обязательны.
+ *
+ * Проверка появилась вместе с переездом свойств в тело сцены: раньше отказ приходил на
+ * собственный запрос свойства и дальше него не шёл, а теперь одно незаполненное свойство
+ * не даёт сохранить всю схему. Сообщение бэкенда называет только имя свойства, поэтому
+ * возвращаем пару «элемент → свойство».
+ */
+const invalidProperties = (elements: DiagramElement[]): string[] => {
+  const problems: string[] = [];
+  for (const el of elements) {
+    for (const p of el.properties ?? []) {
+      const name = p.name?.trim();
+      const where = el.label?.trim() || el.type;
+      if (!name) problems.push(`«${where}»: свойство без названия`);
+      else if (!p.value_type?.trim()) problems.push(`«${where}» → «${name}»: не указан тип значения`);
+    }
+  }
+  return problems;
+};
+
 const markSceneSaved = (persisted: boolean) => {
   savedElementsSnapshot = useEditorStore.getState().elements;
   useEditorStore.setState({
@@ -1083,10 +1544,104 @@ export const useEditorStore = create<EditorState>()(temporal(
       sceneList: [],
       currentProject: null,
       projectList: [],
+      projectRuntimeFlags: {},
+      projectProdVersions: {},
+      sceneSource: "draft",
+      releaseVersionNo: null,
+      releaseError: null,
+      setReleaseVersionNo: (versionNo) => {
+        if (get().releaseVersionNo !== versionNo) set({releaseVersionNo: versionNo});
+      },
+      setSceneSource: (source) => {
+        const state = get();
+        if (state.sceneSource === source) return;
+
+        if (source === "release") {
+          // Просмотр версии — тоже подмена холста; сначала вернуть живой документ, иначе в
+          // стеш легла бы версия вместо правок.
+          if (state.versionPreview) state.exitVersionPreview();
+          const s = get();
+          draftStash = {
+            projectId: s.currentProject?.id ?? null,
+            scene: s.scene,
+            sceneList: s.sceneList,
+            elements: s.elements,
+            selectedIds: s.selectedIds,
+            activeGroupKey: s.activeGroupKey,
+            currentComponentStateByElementKey: s.currentComponentStateByElementKey,
+            isDirty: s.isDirty,
+            sceneVersion: s.sceneVersion,
+            savedSnapshot: savedElementsSnapshot,
+          };
+          set({sceneSource: "release", releaseVersionNo: null, releaseError: null, selectedIds: []});
+          // Показанная схема — черновик; в мониторе её место занимает та же схема из выпуска.
+          const projectId = s.currentProject?.id;
+          const sceneId = s.scene?.id;
+          set({scene: null, elements: [], sceneList: []});
+          if (projectId != null) {
+            void get().loadSceneList(projectId).then(list => {
+              if (sceneId == null || get().sceneSource !== "release") return;
+              if (list?.some(x => x.id === Number(sceneId))) void get().loadScene(Number(sceneId));
+            });
+          }
+          return;
+        }
+
+        // Возврат в редактор.
+        const stash = draftStash;
+        draftStash = null;
+        const projectId = state.currentProject?.id ?? null;
+        set({sceneSource: "draft", releaseVersionNo: null, releaseError: null});
+        if (stash && stash.projectId === projectId) {
+          set({
+            scene: stash.scene,
+            sceneList: stash.sceneList,
+            elements: stash.elements,
+            selectedIds: stash.selectedIds,
+            activeGroupKey: stash.activeGroupKey,
+            selectedTableCell: null,
+            currentComponentStateByElementKey: stash.currentComponentStateByElementKey,
+            isDirty: stash.isDirty,
+            sceneVersion: stash.sceneVersion,
+          });
+          // Снимок «что на сервере» — тоже прежний, иначе isDirty пересчитался бы от выпуска.
+          savedElementsSnapshot = stash.savedSnapshot;
+          return;
+        }
+        // Проект сменили в мониторе — черновик прежнего отброшен. Та схема, что открыта
+        // сейчас, перечитывается из черновика: выпуск в редакторе показывать нельзя.
+        const sceneId = state.scene?.id;
+        set({scene: null, elements: [], sceneList: []});
+        if (projectId != null) {
+          void get().loadSceneList(projectId).then(list => {
+            if (sceneId == null || get().sceneSource !== "draft") return;
+            if (list?.some(x => x.id === Number(sceneId))) void get().loadScene(Number(sceneId));
+          });
+        }
+      },
+      reloadRelease: async (versionNo) => {
+        const {currentProject, sceneSource} = get();
+        if (sceneSource !== "release" || !currentProject) return;
+        const projectId = currentProject.id;
+        dropReleaseScenes(projectId);
+        set({releaseVersionNo: versionNo});
+        const list = await get().loadSceneList(projectId);
+        // Пока грузили список, ушли из монитора или сменили проект — дальше не наше.
+        const s = get();
+        if (s.sceneSource !== "release" || s.currentProject?.id !== projectId || !list) return;
+        const currentId = s.scene?.id != null ? Number(s.scene.id) : null;
+        const target = currentId != null && list.some(x => x.id === currentId) ? currentId : list[0]?.id;
+        if (target != null) {
+          await get().loadScene(target);
+        } else {
+          set({scene: null, elements: []});
+        }
+      },
       elements: [],
       selectedIds: [],
       activeGroupKey: null,
       selectedTableCell: null,
+      editAllStates: false,
       editingTextKey: null,
       currentComponentStateByElementKey: {},
       runtimeOverridesByElementKey: {},
@@ -1105,6 +1660,7 @@ export const useEditorStore = create<EditorState>()(temporal(
       versionsKinds: null,
       saveConflict: null,
       staleBaseVersion: null,
+      autosaveError: null,
       versionPreview: null,
 
       camera: {x: 0, y: 0, zoom: 1},
@@ -1120,6 +1676,55 @@ export const useEditorStore = create<EditorState>()(temporal(
       },
       setCamera: (x, y, zoom) => set({camera: {x, y, zoom}}),
 
+      setMonitorView: (view) => {
+        const {scene, currentProject, versionPreview} = get();
+        // Просмотр версии — только для чтения; сцена чужого проекта — не наша.
+        if (versionPreview || !sceneBelongsToCurrentProject(scene, currentProject)) return;
+
+        set(state => {
+          const meta = state.elements.find(isMetaElement);
+          if (meta) {
+            const {monitorView: _old, ...rest} = meta as unknown as Record<string, unknown>;
+            void _old;
+            const next = view ? {...rest, monitorView: view} : rest;
+            return {
+              elements: state.elements.map(el => el.key === meta.key ? next as unknown as DiagramElement : el),
+            };
+          }
+          if (!view) return {};
+
+          // Служебного элемента ещё нет (лист по умолчанию) — заводим его тем же видом, что
+          // и setSheet, но без блока `canvas`: лист остаётся по умолчанию.
+          const created = {
+            id: null,
+            key: createUuid(),
+            type: "meta",
+            visible: false,
+            monitorView: view,
+            x: 0, y: 0, w: 0, h: 0,
+            composition: [],
+            parentId: scene?.id ?? null,
+            parentKey: String(scene?.id ?? ""),
+            children: [],
+            label: "Лист",
+            scripts: [], bindings: [], properties: [],
+            states: [{id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true}],
+          } as unknown as DiagramElement;
+          return {elements: [...state.elements, created]};
+        });
+      },
+
+      ensureElementVisible: (key) => {
+        const {elements, canvasRect, camera} = get();
+        if (!canvasRect) return;
+        const el = getElementIndex(elements).byKey[key];
+        if (!el) return;
+        const next = cameraToReveal(getElementBoundsRendered(el, elements), camera, canvasRect);
+        // null — элемент уже виден. Пишем только реальное движение: лишний set()
+        // перерисовал бы холст на ровном месте.
+        if (next) set({camera: next});
+      },
+
       pendingPlacement: null,
       setPendingPlacement: (p) => set({pendingPlacement: p}),
       moveSelectedBy: (dx, dy, excludeKey) => {
@@ -1132,6 +1737,21 @@ export const useEditorStore = create<EditorState>()(temporal(
 
         const shifts = new Map(keysToMove.map(k => [k, {dx, dy}] as const));
         set({elements: applyShifts(elements, shifts, scene?.id)});
+      },
+      transformSelected: (op) => {
+        const {selectedIds, elements, scene} = get();
+        if (!selectedIds.length) return;
+
+        // Только верхнеуровневые: у элемента с выделенным предком геометрию пересчитает
+        // сам предок, иначе поворот применился бы к нему дважды.
+        const keys = topLevelSelectedKeys(selectedIds, elements);
+        if (!keys.length) return;
+
+        const next = transformSelection(elements, keys, op, snap);
+        if (next === elements) return;
+
+        // Одним set() — значит одним шагом undo на всю операцию.
+        set({elements: recomputeAncestorBounds(next, keys, scene?.id)});
       },
       alignSelected: (mode) => {
         const {selectedIds, elements, scene} = get();
@@ -1203,34 +1823,91 @@ export const useEditorStore = create<EditorState>()(temporal(
         const keys = elements.filter(el => String(el.parentKey) === scopeKey).map(el => el.key);
         if (keys.length) set({selectedIds: keys, selectedTableCell: null});
       },
+      // Порядок отрисовки задаёт `zIndex` (в пределах контейнера — среди соседей
+      // с общим parentKey), поэтому «на передний/задний план» — это просто выход
+      // за текущий диапазон слоёв соседей. Перекладывать массивы больше не нужно:
+      // порядок массива остался лишь тай-брейком при равных слоях.
       bringToFront: (key) => {
         const {elements} = get();
         const el = elements.find(e => e.key === key);
         if (!el) return;
-        // Порядок отрисовки: верхний уровень — порядок плоского массива;
-        // внутри контейнера — порядок composition/children родителя. Двигаем в обоих местах.
-        const moveToEnd = (arr: string[]) => arr.includes(key) ? [...arr.filter(k => k !== key), key] : arr;
-        const next = [...elements.filter(e => e.key !== key), el].map(e =>
-          e.key === el.parentKey
-            ? {...e, children: moveToEnd(e.children), composition: moveToEnd(e.composition ?? [])} as DiagramElement
-            : e,
+        const top = elements.reduce(
+          (acc, e) => (e.key !== key && String(e.parentKey) === String(el.parentKey)
+            ? Math.max(acc, zIndexOf(e))
+            : acc),
+          0,
         );
-        set({elements: next});
+        get().updateElementVisual(key, {zIndex: top + 1});
       },
       sendToBack: (key) => {
         const {elements} = get();
         const el = elements.find(e => e.key === key);
         if (!el) return;
-        const moveToStart = (arr: string[]) => arr.includes(key) ? [key, ...arr.filter(k => k !== key)] : arr;
-        const next = [el, ...elements.filter(e => e.key !== key)].map(e =>
-          e.key === el.parentKey
-            ? {...e, children: moveToStart(e.children), composition: moveToStart(e.composition ?? [])} as DiagramElement
-            : e,
+        const bottom = elements.reduce(
+          (acc, e) => (e.key !== key && String(e.parentKey) === String(el.parentKey)
+            ? Math.min(acc, zIndexOf(e))
+            : acc),
+          0,
         );
-        set({elements: next});
+        get().updateElementVisual(key, {zIndex: bottom - 1});
       },
 
       setCanvasRect: (rect) => set({canvasRect: rect}),
+      /**
+       * Размер листа сцены.
+       *
+       * Пишем в блок `canvas` служебного элемента, а не в поля сцены: эндпоинта
+       * обновления сцены не существует (у неё только GET, POST-создание и DELETE),
+       * а служебный элемент сохраняется вместе со всеми остальными и переживает
+       * round-trip. Приём не наш — так уже устроен `contur_meta` у CONTUR.
+       */
+      setSheet: (w, h) => {
+        const {scene, currentProject} = get();
+        if (!sceneBelongsToCurrentProject(scene, currentProject)) return;
+
+        const clamp = (v: number) => Math.min(SHEET_MAX, Math.max(SHEET_MIN, snap(v)));
+        const next = {w: clamp(w), h: clamp(h)};
+        if (isSameSheet(resolveSheet(get().elements), next)) return;
+
+        set(state => {
+          const meta = state.elements.find(isMetaElement);
+
+          if (meta) {
+            return {
+              elements: state.elements.map(el => el.key === meta.key
+                ? {
+                  ...el,
+                  canvas: {
+                    // Остальные поля блока (units/grid/scale/origin) — данные CONTUR,
+                    // сохраняем как есть.
+                    ...((el as unknown as Record<string, unknown>).canvas as object ?? {}),
+                    width: next.w,
+                    height: next.h,
+                  },
+                } as unknown as DiagramElement
+                : el),
+            };
+          }
+
+          const created = {
+            id: null,
+            key: createUuid(),
+            type: "meta",
+            visible: false,
+            canvas: {width: next.w, height: next.h, units: "px", grid: GRID},
+            x: 0, y: 0, w: 0, h: 0,
+            composition: [],
+            parentId: scene?.id ?? null,
+            parentKey: String(scene?.id ?? ""),
+            children: [],
+            label: "Лист",
+            scripts: [], bindings: [], properties: [],
+            states: [{id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true}],
+          } as unknown as DiagramElement;
+
+          return {elements: [...state.elements, created]};
+        });
+      },
       addComponentStateToSubtree: (elementKey, stateName) => {
         let rootStateId: string | null = null;
 
@@ -1312,6 +1989,98 @@ export const useEditorStore = create<EditorState>()(temporal(
           };
         });
       },
+      /**
+       * Места в пользовательском коде поддерева, где упомянуто имя состояния.
+       *
+       * Read-only: список нужен UI ДО мутации, чтобы спросить, переписывать ли код.
+       * Живёт в сторе, потому что поддерево считает модульный `getDescendantKeys`.
+       */
+      findStateUsages: (elementKey, stateName) => {
+        const {elements} = get();
+        const subtreeKeys = new Set([elementKey, ...getDescendantKeys(elementKey, elements)]);
+        return findStateNameRefs(elements, subtreeKeys, stateName);
+      },
+      /**
+       * Переименование состояния каскадом по имени — симметрично добавлению и удалению.
+       *
+       * Имя состояния связывает поддерево: `cascadeStateByName` и `buildShapeDescriptor`
+       * сопоставляют состояния родителя и потомков именно по нему. Переименовать только у
+       * корня — значит увести потомков в состояние по умолчанию и запечь при сохранении
+       * визуал не того состояния.
+       *
+       * `serverId`, `id`, `isDefault` и `overrides` сохраняются спредом: `serverId` —
+       * единственное, по чему бэкенд отличает переименование от «удалили и создали заново»
+       * (§2 контракта версий). `currentComponentStateByElementKey` не трогаем — карта по
+       * `id`, а `id` не меняется.
+       */
+      renameComponentStateInSubtree: (elementKey, oldName, newName, opts) => {
+        if (oldName === newName) return;
+
+        set(state => {
+          const root = state.elements.find(el => el.key === elementKey);
+          if (!root || !root.states.some(s => s.name === oldName)) return {};
+
+          const keysToUpdate = new Set([elementKey, ...getDescendantKeys(elementKey, state.elements)]);
+          let changed = false;
+
+          const nextElements = state.elements.map(el => {
+            if (!keysToUpdate.has(el.key)) return el;
+
+            const hasState = el.states.some(s => s.name === oldName);
+
+            // Правка кода идёт тем же set() — один шаг undo на переименование целиком.
+            // Клонируем ТОЛЬКО реально изменившиеся строки и возвращаем исходный массив,
+            // если не изменилось ничего: иначе элемент с посторонними биндингами считался
+            // бы изменённым и пачкал бы сцену на ровном месте.
+            let bindings = el.bindings;
+            let events = el.events;
+
+            if (opts?.rewriteCode) {
+              if (el.bindings?.length) {
+                let touched = false;
+                const next = el.bindings.map(b => {
+                  if (!b.code) return b;
+                  const code = renameStateNameInCode(b.code, oldName, newName);
+                  if (code === b.code) return b;
+                  touched = true;
+                  return {...b, code};
+                });
+                if (touched) bindings = next;
+              }
+              if (el.events?.length) {
+                let touched = false;
+                const next = el.events.map(e => {
+                  const code = e.handler?.code;
+                  if (!code) return e;
+                  const nextCode = renameStateNameInCode(code, oldName, newName);
+                  if (nextCode === code) return e;
+                  touched = true;
+                  return {...e, handler: {...e.handler, code: nextCode}};
+                });
+                if (touched) events = next;
+              }
+            }
+
+            const codeChanged = bindings !== el.bindings || events !== el.events;
+
+            if (!hasState && !codeChanged) return el;
+            changed = true;
+
+            return {
+              ...el,
+              ...(hasState
+                ? {states: el.states.map(s => s.name === oldName ? {...s, name: newName} : s)}
+                : {}),
+              ...(bindings !== el.bindings ? {bindings} : {}),
+              ...(events !== el.events ? {events} : {}),
+            } as DiagramElement;
+          });
+
+          // Холостая правка не должна плодить новый массив: на его ссылке завязаны
+          // equality истории undo и флаг несохранённых изменений.
+          return changed ? {elements: nextElements} : {};
+        });
+      },
       // Каскад по имени состояния — для любого контейнера (группа или complex-компонент);
       // у листа потомков нет, каскад просто не сработает (см. cascadeStateByName).
       setCurrentComponentStateId: (elementKey, componentState) => set(state => ({
@@ -1380,7 +2149,7 @@ export const useEditorStore = create<EditorState>()(temporal(
       // Мульти-версия: один set() (= один шаг undo) для всех ключей.
       updateElementsVisual: (keys, updates) => {
          if (!keys.length) return;
-         const { currentComponentStateByElementKey } = get();
+         const { currentComponentStateByElementKey, editAllStates } = get();
          const keySet = new Set(keys);
 
          set(state => {
@@ -1426,34 +2195,58 @@ export const useEditorStore = create<EditorState>()(temporal(
              // Сравниваем с ФАКТИЧЕСКИМ значением (база + overrides состояния), а не
              // только с overrides: у нетронутого элемента позиция лежит в базе, и
              // сравнение с пустыми overrides считало бы любую запись изменением.
-             const currentState = el.states.find(s => s.id === currentComponentStateId);
-             const effective = {
+             //
+             // В режиме «править все состояния» проверять одно текущее нельзя: патч,
+             // совпавший с ним, но отличный от остальных, обязан примениться — иначе
+             // выравнивание состояний молча не срабатывало бы.
+             const effectiveOf = (st: ComponentState | undefined) => ({
                ...(el as unknown as Record<string, unknown>),
-               ...(currentState?.overrides ?? {}),
-             };
-             if (!isPatchEffective(effective, validatedUpdates)) return el;
+               ...(st?.overrides ?? {}),
+             });
+             const patchLands = editAllStates
+               ? el.states.some(st => isPatchEffective(effectiveOf(st), validatedUpdates))
+               : isPatchEffective(effectiveOf(el.states.find(s => s.id === currentComponentStateId)), validatedUpdates);
+             if (!patchLands) return el;
              anyChanged = true;
+
+             // Часть ключей (BASE_ONLY_KEYS, например слой zIndex) пишем в базу даже
+             // у листа: они не зависят от состояния. Если состояний-специфичных
+             // ключей в патче нет — states не пересобираем.
+             const {base: baseUpdates, state: stateUpdates} = splitBaseOnly(validatedUpdates);
 
              return {
                ...el,
-               states: el.states.map(s =>
-                 s.id === currentComponentStateId
-                   ? {
-                     ...s,
-                     overrides: {
-                       ...s.overrides,
-                       ...validatedUpdates,
-                     },
-                   }
-                   : s
-               ),
+               ...baseUpdates,
+               // editAllStates — правка ложится во ВСЕ состояния элемента: оформление,
+               // одинаковое во всех состояниях, иначе пришлось бы повторять руками в каждом.
+               states: Object.keys(stateUpdates).length
+                 ? el.states.map(s =>
+                   (editAllStates || s.id === currentComponentStateId)
+                     ? {
+                       ...s,
+                       overrides: {
+                         ...s.overrides,
+                         ...stateUpdates,
+                       },
+                     }
+                     : s
+                 )
+                 : el.states,
              } as DiagramElement;
            });
 
            if (!anyChanged) return {};
 
-           // Если изменились позиционные поля — пересчитываем рамки групп-предков
-           const POSITIONAL_KEYS = new Set(["x", "y", "w", "h", "x1", "y1", "x2", "y2", "radius", "points"]);
+           // Если изменились поля, влияющие на габарит — пересчитываем рамки групп-предков.
+           //
+           // Кроме собственно позиционных сюда входят: параметры текста (его габарит меряет
+           // `measureText`, а не `w/h` — укоротил подпись, и рамка осталась под старую длину),
+           // `rotate` (меняется осевой bbox) и `visible` (скрытый элемент из рамки выпадает,
+           // см. isBoundsContributor).
+           const POSITIONAL_KEYS = new Set([
+             "x", "y", "w", "h", "x1", "y1", "x2", "y2", "radius", "points",
+             "text", "fontSize", "fontFamily", "bold", "autoWidth", "rotate", "visible",
+           ]);
            const hasPositionalChange = Object.keys(updates).some(k => POSITIONAL_KEYS.has(k));
            if (hasPositionalChange) {
              return { elements: recomputeAncestorBounds(updatedElements, keys, state.scene?.id) };
@@ -1483,7 +2276,25 @@ export const useEditorStore = create<EditorState>()(temporal(
         return {selectedIds: same ? state.selectedIds : [...ids], selectedTableCell: null};
       }),
       clearSelection: () => set({selectedIds: [], selectedTableCell: null}),
-      enterGroup: (key) => set({activeGroupKey: key, selectedIds: [], selectedTableCell: null}),
+      // editingTextKey сбрасываем вместе с уровнем: начатая внутри группы правка текста
+      // иначе переживала бы выход из неё, и оверлей висел бы над недоступной фигурой.
+      enterGroup: (key) => set({
+        activeGroupKey: key, selectedIds: [], selectedTableCell: null, editingTextKey: null,
+      }),
+      revealElement: (key) => set(state => {
+        const el = state.elements.find(e => e.key === key);
+        if (!el) return {};
+        // Родитель — группа? Тогда открываем её. Элемент корня сцены поднимает нас в корень.
+        const parent = state.elements.find(e => e.key === el.parentKey);
+        return {
+          activeGroupKey: parent && parent.type === "group" ? parent.key : null,
+          selectedIds: [key],
+          selectedTableCell: null,
+          editingTextKey: null,
+        };
+      }),
+      setEditAllStates: (value) => set({editAllStates: value}),
+
       selectTableCell: (elementKey, row, col) => set({selectedTableCell: {elementKey, row, col}}),
       setEditingTextKey: (key) => set({editingTextKey: key}),
       clearTableCellSelection: () => set({selectedTableCell: null}),
@@ -1498,6 +2309,7 @@ export const useEditorStore = create<EditorState>()(temporal(
           activeGroupKey: parentIsGroup ? parentKey! : null,
           selectedIds: [],
           selectedTableCell: null,
+          editingTextKey: null,
         };
       }),
       addTemplate: (screenX, screenY, template) => {
@@ -1508,54 +2320,67 @@ export const useEditorStore = create<EditorState>()(temporal(
           return;
         }
 
-        const x = snap(screenX);
-        const y = snap(screenY);
-
-        const keyMap: Record<string, string> = {};
-        template.forEach(el => {
-          keyMap[el.key] = createUuid();
-        });
-
-        const root = template.find(el => el.type === "group") || template[0];
-
-        const newElements = template.map(el => {
-          // 1. Формируем базовый обновленный элемент (меняем только ключи и связи)
-          const updatedElement = {
-            ...el,
-            id: null,
-            key: keyMap[el.key],
-            parentKey: el.parentKey ? (keyMap[el.parentKey] || el.parentKey) : null,
-            children: el.children ? el.children.map(childKey => keyMap[childKey] || childKey) : undefined,
-            composition: el.composition ? el.composition.map(k => keyMap[k] || k) : [],
-            // Экземпляр шаблона — новая сущность сцены; серверные id вложенных
-            // сущностей принадлежат самому шаблону и уехать вместе с копией не должны.
-            scripts: detachServerScriptIds((el as DiagramElement).scripts),
-            bindings: detachServerBindingIds((el as DiagramElement).bindings),
-            ...((el as DiagramElement).events
-              ? {events: detachServerEventIds((el as DiagramElement).events)}
-              : {}),
-            states: detachServerStateIds((el as DiagramElement).states),
-            // Дочерние элементы шаблона ещё не сохранены на сервере,
-            // поэтому parentId у них null — бэкенд проставит id при сохранении сцены.
-            parentId: null,
-          };
-
-          // 2. Если это НАШ корневой элемент — задаем ему новые координаты на холсте
-          //    и привязываем к текущей сцене (parentId = scene.id, parentKey = String(scene.id)).
-          if (el.key === root.key) {
-            updatedElement.x = x;
-            updatedElement.y = y;
-            updatedElement.parentKey = String(scene?.id);
-            updatedElement.parentId = scene?.id ?? null;
-          }
-
-          return updatedElement as DiagramElement;
+        // Клонирование и позиционирование живут в `instantiateTemplate`: тем же кодом
+        // пользуется импорт плана устройств, которому нужны сотни экземпляров разом.
+        const newElements = instantiateTemplate(template, {
+          x: screenX,
+          y: screenY,
+          sceneId: scene?.id ?? null,
         });
 
         set(state => ({
           elements: [...state.elements, ...newElements],
         }));
 
+      },
+      addImportedElements: (elements, mode) => {
+        const {scene, currentProject} = get();
+
+        if (!sceneBelongsToCurrentProject(scene, currentProject)) {
+          toast.error("Нельзя импортировать: сцена не принадлежит выбранному проекту");
+          return;
+        }
+
+        set(state => ({
+          elements: mode === "replace" ? elements : [...state.elements, ...elements],
+        }));
+      },
+      buildSceneExport: () => {
+        const {elements, scene} = get();
+        const ownKeys = new Set(elements.map(el => el.key));
+
+        const exported = elements.map(el => {
+          // Серверные id снимаем те же, что и при копировании (см. detachServer*Ids):
+          // файл может уехать в другую сцену или другой проект, и чужой id там означает
+          // «эта сущность переехала» — оригинал потеряет своё, а слияние выдаст конфликт.
+          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          const {id: _id, parentId: _parentId, ...rest} = el as unknown as Record<string, unknown>;
+
+          return {
+            ...rest,
+            id: null,
+            parentId: null,
+            // Корни помечаем так, как описано в нашей же спецификации импорта: ключа
+            // сцены в файле нет, и «undefined» честнее, чем id чужой сцены.
+            parentKey: el.parentKey && ownKeys.has(el.parentKey) ? el.parentKey : "undefined",
+            states: detachServerStateIds(el.states),
+            scripts: detachServerScriptIds(el.scripts),
+            bindings: detachServerBindingIds(el.bindings),
+            ...(el.events ? {events: detachServerEventIds(el.events)} : {}),
+          };
+        });
+
+        // Конверт, а не голый массив: по нему импорт узнаёт СВОЙ файл и не запускает
+        // нормализатор CONTUR повторно. Схема, однажды пришедшая из выгрузки, хранит её
+        // поля (`lua_name`, `tech_object`) — детектор диалекта сработал бы на них снова
+        // и второй раз вычел радиус из координат каждого кружка.
+        return {
+          format: SCENE_EXPORT_FORMAT,
+          version: 1,
+          exported_at: new Date().toISOString(),
+          scene: {name: scene?.name ?? null},
+          elements: exported,
+        };
       },
       importElementsFromJson: (rawElements, importOpts) => {
         const {scene, currentProject} = get();
@@ -1567,11 +2392,22 @@ export const useEditorStore = create<EditorState>()(temporal(
 
         // Выгрузка CONTUR приходит в своих именах полей и своей системе координат —
         // переводим ДО общей нормализации, чтобы дальше всё шло одним путём.
-        const contur = isConturExport(rawElements) ? normalizeConturElements(rawElements) : null;
+        // `native` — файл нашего же экспорта: поля уже в наших именах и координатах.
+        const contur = !importOpts?.native && isConturExport(rawElements)
+          ? normalizeConturElements(rawElements)
+          : null;
         if (contur) rawElements = contur.elements;
 
-        const CANVAS_W = 5000;
-        const CANVAS_H = 5000;
+        // База процентных координат — размер ЛИСТА, на котором чертёж нарисован:
+        // процент осмыслен только относительно него, а не относительно константы.
+        // Лист берём из служебного элемента файла (`meta.canvas`).
+        //
+        // Фолбэк намеренно 5000, а не размер листа по умолчанию: проценты шлёт
+        // только прошлое поколение выгрузок CONTUR, а у него служебного элемента
+        // нет вовсе. Подставить туда лист — молча растянуть все такие файлы.
+        const rawSheet = readSheetFromRaw(rawElements as Record<string, unknown>[]);
+        const CANVAS_W = rawSheet?.w ?? 5000;
+        const CANVAS_H = rawSheet?.h ?? 5000;
 
         const isNullish = (v: unknown) =>
           v == null || v === "null" || v === "undefined";
@@ -1654,7 +2490,8 @@ export const useEditorStore = create<EditorState>()(temporal(
             children,
             scripts:     Array.isArray(raw.scripts)    ? raw.scripts    : [],
             bindings:    Array.isArray(raw.bindings)   ? raw.bindings   : [],
-            properties:  Array.isArray(raw.properties) ? raw.properties : [],
+            // Старые выгрузки несут description вместо gateway_name — см. normalizeProperty.
+            properties:  Array.isArray(raw.properties) ? raw.properties.map(normalizeProperty) : [],
             states,
             // Convert percentage strings to pixel coordinates using the logical canvas size
             x:  parseCoord(raw.x,  CANVAS_W),
@@ -1689,6 +2526,56 @@ export const useEditorStore = create<EditorState>()(temporal(
         const x = snap(screenX);
         const y = snap(screenY);
 
+        /**
+         * Кладёт готовый элемент в схему — в открытый контейнер, если пользователь в него
+         * вошёл, иначе в корень сцены.
+         *
+         * Раньше все ветки писали `parentKey: scene.id` намертво, и добавить примитив в
+         * компонент было нельзя вообще: приходилось класть его рядом и потом «Переместить
+         * в группу». Элемент строится в МИРОВЫХ координатах, поэтому внутрь контейнера он
+         * переезжает сдвигом на его абсолютную позицию (`shiftElementPositions` двигает и
+         * `x/y`, и концы линии, и overrides всех состояний).
+         */
+        const commitNewElement = (element: DiagramElement) => {
+          const {activeGroupKey, elements} = get();
+          const {byKey} = getElementIndex(elements);
+          const host = activeGroupKey ? byKey[activeGroupKey] : undefined;
+
+          if (!host || !isGroup(host)) {
+            set(state => ({elements: [...state.elements, element]}));
+            return;
+          }
+
+          const hostAbs = getAbsoluteRenderedPos(host, byKey);
+          const local = shiftElementPositions(element, -hostAbs.x, -hostAbs.y);
+          const member: DiagramElement = {
+            ...local,
+            parentKey: host.key,
+            parentId: host.id ?? null,
+          };
+
+          // Роль в контейнере — та же, что у resplitContainer: примитивы компонента
+          // живут в composition, компоненты — в children.
+          const toComposition = isLeafPrimitive(member) && isComponentEl(host);
+
+          set(state => {
+            let next = [
+              ...state.elements.map(el => el.key !== host.key ? el : ({
+                ...el,
+                children: toComposition ? el.children : [...el.children, member.key],
+                composition: toComposition
+                  ? [...(el.composition ?? []), member.key]
+                  : (el.composition ?? []),
+              } as DiagramElement)),
+              member,
+            ];
+            // Новый член сразу получает весь набор состояний контейнера.
+            next = syncMemberStates(next, host.key, [member.key]);
+            // Рамка контейнера обязана вырасти под новый элемент.
+            return {elements: recomputeAncestorBounds(next, [member.key], scene?.id)};
+          });
+        };
+
         if (type === 'line') {
           const newElement: DiagramElement = {
             id: null,
@@ -1719,10 +2606,28 @@ export const useEditorStore = create<EditorState>()(temporal(
             }],
           };
 
-          set(state => ({
-            elements: [...state.elements, newElement]
-          }))
+          commitNewElement(newElement);
 
+          return;
+        }
+
+        if (type === 'curve') {
+          // Кубическая кривая Безье: точки локальны относительно x/y (как у полигона),
+          // поэтому перетаскивание меняет только x/y, а форма живёт в points.
+          const points = [...DEFAULT_CURVE_POINTS];
+          const bounds = curvePointsBounds(points);
+          const newElement: DiagramElement = {
+            id: null, key: createUuid(), type, composition,
+            x, y, w: bounds.maxX - bounds.minX, h: bounds.maxY - bounds.minY,
+            points,
+            label: "",
+            bg: "transparent", strokeColor: "#9ca3af", strokeWidth: 2, strokeDasharray: "",
+            arrowStart: false, arrowEnd: false,
+            parentId: scene?.id || null, parentKey: String(scene?.id) || null,
+            children: [], scripts: [], bindings: [], properties: [],
+            states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
+          };
+          commitNewElement(newElement);
           return;
         }
 
@@ -1741,7 +2646,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1756,7 +2661,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1771,7 +2676,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1779,13 +2684,14 @@ export const useEditorStore = create<EditorState>()(temporal(
           const newElement: DiagramElement = {
             id: null, key: createUuid(), type, composition,
             x, y, w: 120, h: 40,
-            label: "Кнопка", color: "#3b82f6", textColor: "#ffffff",
+            // label — название элемента, text — надпись на кнопке: поля независимы.
+            label: "Кнопка", text: "Кнопка", color: "#3b82f6", textColor: "#ffffff", fontSize: 16,
             rx: 6, pressed: false, enabled: true, bg: "transparent",
             parentId: scene?.id || null, parentKey: String(scene?.id) || null,
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1799,7 +2705,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1813,7 +2719,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1827,7 +2733,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1841,7 +2747,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1861,7 +2767,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             label: "Картинка",
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1878,7 +2784,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             children: [], scripts: [], bindings: [], properties: [],
             states: [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
           };
-          set(state => ({ elements: [...state.elements, newElement] }));
+          commitNewElement(newElement);
           return;
         }
 
@@ -1911,95 +2817,106 @@ export const useEditorStore = create<EditorState>()(temporal(
           }],
         };
 
-        set(state => ({
-          elements: [...state.elements, newElement]
-        }))
+        commitNewElement(newElement);
       },
-      addTags: async (payload: PropertyCreateRequestDto) => {
-        try {
-          // В очередь: правка свойства двигает версию сцены, и параллельные правки
-          // разошлись бы по базе (см. queuePropertyWrite).
-          await queuePropertyWrite(async () => {
-            const res = await fetch(`/api/editor/tags`, {
-              method: "POST",
-              headers: {"Content-Type": "application/json"},
-              // `based_on_version` — §8 контракта: с 17.08.2026 точечные правки свойств
-              // проверяются гардом версии, и без номера сохранённая сцена отвечает 400.
-              body: JSON.stringify({...payload, ...propertyVersionField()})
-            });
+      /**
+       * Свойства — обычная часть сцены, а не отдельный ресурс.
+       *
+       * Раньше каждая правка уходила своим запросом (`/api/editor/tags`), и из-за этого
+       * свойство нельзя было завести элементу, которого ещё нет на сервере: серверный
+       * `component_id` появлялся только после сохранения. Теперь свойство правится
+       * локально и уезжает вместе со сценой одним PUT — бэкенд принимает весь список в
+       * `ComponentCreateDto.properties`, сам заводит новые и привязывает к ним биндинги
+       * по `component_property_name`.
+       *
+       * Адресуем КЛЮЧОМ элемента, а не серверным `component_id`: у несохранённого
+       * элемента тот равен null и совпал бы с любым другим несохранённым.
+       *
+       * Следствия: правки попадают в undo (им там и место — они локальные) и помечают
+       * сцену изменённой. Сеть остаётся ровно в одном месте — переименовании.
+       */
+      addProperty: (elementKey, payload) => {
+        const owner = get().elements.find(el => el.key === elementKey);
+        if (!owner) return false;
 
-            if (!res.ok) throw await propertyWriteError(res, "Не удалось добавить свойство");
-
-            const created: PropertyCreateDto = await res.json();
-            // Некоторые бэкенды пока не round-trip'ят position на одиночном
-            // REST-эндпоинте свойства (в отличие от bulk-сохранения компонента) —
-            // подстраховываемся значением, которое сами отправили.
-            const newProperty: PropertyCreateDto = {
-              ...created,
-              position: created.position ?? payload.position ?? null,
-            };
-
-            // Свойство уже создано на сервере — не пишем эту мутацию в историю undo,
-            // иначе Ctrl+Z уберёт его только на клиенте (рассинхрон с бэкендом).
-            const temporal = useEditorStore.temporal.getState();
-            temporal.pause();
-            set(state => ({
-              elements: state.elements.map(el =>
-                el.id === payload.component_id
-                  ? { ...el, properties: [...(el.properties || []), newProperty]} as DiagramElement
-                  : el
-              )
-            }));
-            temporal.resume();
-
-            await syncSceneVersionAfterPropertyWrite();
-          });
-        } catch (err: unknown) {
-          console.error(err);
-          toast.error(getErrorMessage(err, "Ошибка при добавлении свойства"));
+        const name = payload.name.trim();
+        // Имя — ключ сопоставления на бэкенде (сначала по id, потом по имени), поэтому
+        // дубль в пределах компонента сделал бы сопоставление неоднозначным.
+        if ((owner.properties ?? []).some(p => p.name.trim() === name)) {
+          toast.error(`Свойство «${name}» у этого элемента уже есть`);
+          return false;
         }
+
+        set(state => ({
+          elements: state.elements.map(el => el.key === elementKey
+            ? {...el, properties: [...(el.properties ?? []), {...payload, name}]} as DiagramElement
+            : el),
+        }));
+        return true;
       },
-      editProperty: async (propertyId: number, payload: PropertyCreateRequestDto) => {
-        // Очередь обязательна: перетаскивание строки в панели свойств вызывает
-        // editProperty сразу на несколько строк, и параллельно они ушли бы с одной и
-        // той же (уже устаревшей после первой) базой — см. queuePropertyWrite.
-        await queuePropertyWrite(async () => {
-          const res = await fetch(`/api/editor/tags/${propertyId}`, {
-            method: "PUT",
-            headers: {"Content-Type": "application/json"},
-            // `based_on_version` — §8 контракта (см. addTags). `component_id` шлём
-            // прежний: перенос свойства на другой компонент бэкенд отвергает.
-            body: JSON.stringify({...payload, ...propertyVersionField()})
-          });
+      editProperty: async (elementKey, target, payload) => {
+        const owner = get().elements.find(el => el.key === elementKey);
+        if (!owner) return false;
 
-          if (!res.ok) throw await propertyWriteError(res, "Не удалось обновить свойство");
+        const name = payload.name.trim();
+        const isSame = (p: PropertyCreateDto) => target.id != null
+          ? p.id === target.id
+          : p.id == null && p.name === target.name;
 
-          const updated: PropertyCreateDto = await res.json();
-          // См. addTags — тот же fallback на случай, если бэкенд не round-trip'ит
-          // position на одиночном REST-эндпоинте свойства.
-          const updatedProperty: PropertyCreateDto = {
-            ...updated,
-            position: updated.position ?? payload.position ?? null,
+        if ((owner.properties ?? []).some(p => !isSame(p) && p.name.trim() === name)) {
+          toast.error(`Свойство «${name}» у этого элемента уже есть`);
+          return false;
+        }
+
+        // ЕДИНСТВЕННЫЙ оставшийся сетевой вызов.
+        //
+        // Раньше он был нужен ради рецептов: их значения ключевались ИМЕНЕМ свойства и
+        // переезжали на новое имя только этим точечным PUT. С 09.09.2026 рецепт — процедура
+        // над ТЕГАМИ, о свойствах компонента он не знает вовсе, и той причины не осталось.
+        // Вызов сохранён: что ещё делает `PUT /api/editor/properties/{id}` на бэкенде,
+        // отсюда не видно, и убирать его надо отдельно и осознанно.
+        // Без права правки переименование остаётся локальным, как и любая правка в режиме
+        // просмотра: серверный PUT ответил бы 403 и не дал бы «потыкать» схему.
+        if (target.id != null && target.name.trim() !== name && canWriteCurrentProject()) {
+          const {currentProject, scene} = get();
+          const generation = documentGeneration;
+          const renamed = await renamePropertyOnServer(target.id, {...payload, name});
+          if (!renamed.ok) return false;
+          // Номер версии — ДО локального применения имени (контракт scada-r9lr).
+          adoptPropertyEditVersion(currentProject?.id, scene?.id, generation, renamed.versionNo);
+        }
+
+        set(state => ({
+          elements: state.elements.map(el => el.key === elementKey
+            ? {
+              ...el,
+              properties: (el.properties ?? []).map(p =>
+                isSame(p) ? {...p, ...payload, name} : p),
+            } as DiagramElement
+            : el),
+        }));
+        return true;
+      },
+      deleteProperty: (elementKey, target) => {
+        // Просмотр версии — режим только для чтения.
+        if (get().versionPreview) return;
+
+        const owner = get().elements.find(el => el.key === elementKey);
+        if (!owner) return;
+
+        set(state => {
+          // У заведённого свойства могут быть ссылки по номеру: висячий
+          // `component_property_id` роняет сохранение ВСЕЙ сцены 400-м, а висячий
+          // propertyRef тихо ломает логику (см. lib/editor/propertyDependents.ts).
+          // У черновика номера нет — ссылаться на него по номеру нечему.
+          if (target.id != null && owner.id != null) {
+            return {elements: purgePropertyRefs(state.elements, target.id, owner.id)};
+          }
+          return {
+            elements: state.elements.map(el => el.key === elementKey
+              ? {...el, properties: (el.properties ?? []).filter(p => p !== target && p.name !== target.name)} as DiagramElement
+              : el),
           };
-
-          // Серверная мутация — вне истории undo (см. addTags).
-          const temporal = useEditorStore.temporal.getState();
-          temporal.pause();
-          set(state => ({
-            elements: state.elements.map(el =>
-              el.id === payload.component_id
-                ? {
-                    ...el,
-                    properties: (el.properties || []).map(p =>
-                      p.id === propertyId ? updatedProperty : p
-                    )
-                  } as DiagramElement
-                : el
-            )
-          }));
-          temporal.resume();
-
-          await syncSceneVersionAfterPropertyWrite();
         });
       },
       // Биндинги — клиентские данные (уезжают на сервер только с сохранением сцены),
@@ -2104,8 +3021,10 @@ export const useEditorStore = create<EditorState>()(temporal(
         }
 
         set({ clipboard: elements.filter(el => allKeys.has(el.key)) });
-        // Новый буфер — счётчик вставок с нуля (см. pasteSelectedElement).
+        // Новый буфер — счётчики вставок с нуля (см. pasteSelectedElement).
         pasteCount = 0;
+        lastPastePoint = null;
+        stackedPastes = 0;
         toast.success('Скопировано');
       },
       pasteSelectedElement: () => {
@@ -2120,11 +3039,47 @@ export const useEditorStore = create<EditorState>()(temporal(
           return;
         }
 
-        // Смещение накапливается: раньше оно всегда отсчитывалось от оригинала,
-        // поэтому вторая вставка ложилась ровно на первую и выглядела как «ничего
-        // не произошло».
-        pasteCount += 1;
-        const {newElements, newRootKeys} = cloneElementsWithOffset(clipboard, scene, 60 * pasteCount);
+        // Вставляем туда, где курсор: центр вставляемого набора встаёт под мышь.
+        // Так вставка перестаёт быть лотереей «куда упадёт» — место выбирает человек.
+        const pointer = getCanvasPointerWorld();
+        let offset: {dx: number; dy: number};
+
+        if (pointer) {
+          const target = {x: snap(pointer.x), y: snap(pointer.y)};
+
+          // Повторная вставка в ту же точку — лесенкой, иначе копии сложатся невидимо.
+          if (lastPastePoint && lastPastePoint.x === target.x && lastPastePoint.y === target.y) {
+            stackedPastes += 1;
+          } else {
+            stackedPastes = 0;
+          }
+          lastPastePoint = target;
+
+          // Габарит считаем по самому буферу: у корней в нём свои координаты, а
+          // getElementBoundsRendered умеет и линию (концы), и кривую с полигоном (точки).
+          const roots = clipboard.filter(el => !clipboard.some(other => other.key === el.parentKey));
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const root of roots) {
+            const b = getElementBoundsRendered(root, clipboard);
+            if (!Number.isFinite(b.minX)) continue;
+            minX = Math.min(minX, b.minX); minY = Math.min(minY, b.minY);
+            maxX = Math.max(maxX, b.maxX); maxY = Math.max(maxY, b.maxY);
+          }
+
+          const step = stackedPastes * GRID;
+          offset = Number.isFinite(minX)
+            ? {
+                dx: snap(target.x - (minX + maxX) / 2) + step,
+                dy: snap(target.y - (minY + maxY) / 2) + step,
+              }
+            : {dx: step, dy: step};
+        } else {
+          // Курсор над холстом ещё не появлялся — прежнее поведение: каскад от оригинала.
+          pasteCount += 1;
+          offset = {dx: 60 * pasteCount, dy: 60 * pasteCount};
+        }
+
+        const {newElements, newRootKeys} = cloneElementsWithOffset(clipboard, scene, offset);
 
         set(state => ({
           elements: [...state.elements, ...newElements],
@@ -2153,6 +3108,8 @@ export const useEditorStore = create<EditorState>()(temporal(
         }));
       },
       exportScene: async (opts) => {
+        // Без права правки на сервер не пишем: автосейв просто пропускает тик.
+        if (!canWriteCurrentProject()) return opts?.silent ? false : refuseViewOnly();
         // Сериализуем все сохранения через общий замок (см. `saveInFlight`),
         // иначе два параллельных POST с id=null создадут дубли на сервере.
         // Автосейв не встаёт в очередь — просто пропускает тик (поймает
@@ -2173,6 +3130,22 @@ export const useEditorStore = create<EditorState>()(temporal(
 
             if (!sceneBelongsToCurrentProject(scene, currentProject)) {
               if (!opts?.silent) toast.error("Сцена не принадлежит выбранному проекту");
+              return false;
+            }
+
+            // Свойства теперь уезжают вместе со сценой, поэтому одно незаполненное
+            // роняет сохранение ЦЕЛИКОМ («Property value_type is required for '…'»).
+            // Бэкенд называет только имя свойства — говорим сами, у какого элемента
+            // искать, и не тратим круг до сервера.
+            const invalid = invalidProperties(elements);
+            if (invalid.length) {
+              if (!opts?.silent) {
+                toast.error("Свойство заполнено не полностью", {
+                  description: invalid.slice(0, 5).join("; ")
+                    + (invalid.length > 5 ? ` и ещё ${invalid.length - 5}` : ""),
+                  duration: 8_000,
+                });
+              }
               return false;
             }
 
@@ -2253,6 +3226,10 @@ export const useEditorStore = create<EditorState>()(temporal(
             const savedVersion: number | null =
               typeof saved?.version_no === "number" ? saved.version_no : null;
 
+            // На сервере теперь другой документ — прежняя запись кэша сцен устарела при
+            // любом исходе ниже. Где дерево из ответа ложится на холст, оно же ляжет и в кэш.
+            if (currentProject) dropScene(currentProject.id, sceneId);
+
             // Пока летел запрос, документ на холсте заменили целиком — почти всегда это
             // восстановление версии, начатое до того, как сохранение успело вернуться.
             // Сохранение состоялось, но описывает уже ПРОШЛОЕ состояние: подменить им
@@ -2261,7 +3238,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             // Поэтому ответ принимаем к сведению и не трогаем ни холст, ни базу; версию
             // спрашиваем у истории, там порядок событий уже разрешён.
             if (documentGeneration !== generationAtSend) {
-              set({saveConflict: null, staleBaseVersion: null});
+              set({saveConflict: null, staleBaseVersion: null, autosaveError: null});
               if (saved?.merged) reportMergedChanges(saved.merged as MergeReport);
               void get().refreshSceneVersion();
               if (get().versions.length) void get().loadVersions();
@@ -2285,6 +3262,8 @@ export const useEditorStore = create<EditorState>()(temporal(
               saveConflict: null,
               // Сохранение прошло — расхождение, о котором предупреждала плашка, закрыто.
               staleBaseVersion: null,
+              // И причина прошлого отказа автосохранения больше не актуальна.
+              autosaveError: null,
               ...(savedVersion != null ? {sceneVersion: savedVersion} : {}),
             });
 
@@ -2317,6 +3296,13 @@ export const useEditorStore = create<EditorState>()(temporal(
                   // в нём никто не гарантировал, доверять ему холст нельзя, и мы уходим
                   // в честную перезагрузку сцены.
                   applyServerComponents(savedComponents, scene);
+                  if (currentProject) {
+                    putScene(
+                      currentProject.id,
+                      {...(scene as unknown as Record<string, unknown>), children: savedComponents},
+                      savedVersion,
+                    );
+                  }
                 } else {
                   await get().loadScene(scene.id, {keepHistory: true});
                 }
@@ -2328,6 +3314,17 @@ export const useEditorStore = create<EditorState>()(temporal(
               // Снимки, снятые до сохранения, содержат id:null у новых элементов, и
               // следующее сохранение вставило бы их повторно (дубли на сервере).
               // Переносим присвоенные сервером id в стек по ключам.
+              // Свойства только что получили серверные номера — раздаём их ссылкам,
+              // которые адресовали свойство парой «ключ элемента + имя». До сохранения
+              // номера не существовало, и рантайму ссылка была не видна.
+              const withRefs = resolvePendingPropertyRefs(get().elements);
+              if (withRefs !== get().elements) {
+                const t = useEditorStore.temporal.getState();
+                t.pause();
+                set({elements: withRefs});
+                t.resume();
+              }
+
               rebaseHistoryIds(get().elements);
 
               if (opts?.keepView) {
@@ -2353,7 +3350,21 @@ export const useEditorStore = create<EditorState>()(temporal(
             return true;
           } catch (err: unknown) {
             console.error(err);
-            toast.error(getErrorMessage(err, opts?.silent ? "Автосохранение не удалось" : "Ошибка экспорта сцены"));
+            if (opts?.silent) {
+              // Автосохранение повторяется каждый такт, и та же причина (синтаксическая
+              // ошибка в скрипте, контракт 25.09.2026) приходила бы тостом раз в 10 минут,
+              // пока скрипт не исправят. Тост — только на НОВУЮ причину, дальше висит
+              // плашка AutosaveErrorBanner.
+              const message = getErrorMessage(err, "Автосохранение не удалось");
+              if (message !== get().autosaveError) {
+                toast.error("Автосохранение не удалось", {description: message});
+              }
+              set({autosaveError: message});
+            } else {
+              // Сообщение бэкенда называет скрипт, компонент и строку — его надо успеть
+              // прочитать, поэтому тост держится дольше обычного.
+              toast.error(getErrorMessage(err, "Ошибка экспорта сцены"), {duration: 30_000});
+            }
             return false;
           } finally {
             set({isSaving: false});
@@ -2499,6 +3510,7 @@ export const useEditorStore = create<EditorState>()(temporal(
       },
       restoreVersion: async (versionNo) => {
         if (!get().scene?.id) return false;
+        if (!canWriteCurrentProject()) return refuseViewOnly();
 
         // Восстановление берёт ТОТ ЖЕ замок, что и сохранение. Без этого летящее
         // сохранение (ручное или автосейв) ложится на сервер уже ПОСЛЕ восстановления и
@@ -2538,11 +3550,22 @@ export const useEditorStore = create<EditorState>()(temporal(
             const trustResponse =
               restored.version_no != null && (restored.components.length > 0 || !hadElements);
 
+            // Восстановление записало новую версию — запись кэша сцен устарела.
+            const projectId = get().currentProject?.id;
+            if (projectId != null) dropScene(projectId, scene.id);
+
             const temporal = useEditorStore.temporal.getState();
             temporal.pause();
             try {
               if (trustResponse) {
                 applyServerComponents(restored.components, scene);
+                if (projectId != null) {
+                  putScene(
+                    projectId,
+                    {...(scene as unknown as Record<string, unknown>), children: restored.components},
+                    restored.version_no,
+                  );
+                }
               } else {
                 await get().loadScene(Number(scene.id), {keepHistory: true});
               }
@@ -2555,11 +3578,11 @@ export const useEditorStore = create<EditorState>()(temporal(
             useEditorStore.temporal.getState().clear();
 
             if (trustResponse) {
-              set({sceneVersion: restored.version_no, saveConflict: null, staleBaseVersion: null});
+              set({sceneVersion: restored.version_no, saveConflict: null, staleBaseVersion: null, autosaveError: null});
               markSceneSaved(true);
             } else {
               // loadScene уже расставил elements/снимок и сам спросил текущую версию.
-              set({saveConflict: null, staleBaseVersion: null});
+              set({saveConflict: null, staleBaseVersion: null, autosaveError: null});
             }
             void get().loadVersions();
 
@@ -2599,6 +3622,7 @@ export const useEditorStore = create<EditorState>()(temporal(
       restorePreviousManualVersion: async () => {
         const sceneId = get().scene?.id;
         if (sceneId == null) return false;
+        if (!canWriteCurrentProject()) return refuseViewOnly();
 
         try {
           // Тянем ВСЕ виды, а не только MANUAL: чтобы понять, «предыдущее» относительно
@@ -2650,16 +3674,37 @@ export const useEditorStore = create<EditorState>()(temporal(
       },
 
       loadSceneList: async (projectId: number) => {
+        const source = get().sceneSource;
         try {
-          const res = await fetch(`/api/editor/scene?project_id=${projectId}`);
+          // Монитор — схемы prod-выпуска; редактор — черновика.
+          const res = await fetch(source === "release"
+            ? `/api/runtime/projects/${projectId}/scenes`
+            : `/api/editor/scene?project_id=${projectId}`);
 
+          // 409 у выпуска — проект не в эксплуатации: это состояние экрана, а не сбой.
+          if (source === "release" && res.status === 409) {
+            if (get().sceneSource !== "release") return;
+            const body = await res.json().catch(() => null) as {message?: string} | null;
+            set({
+              sceneList: [], scene: null, elements: [], releaseVersionNo: null,
+              releaseError: body?.message || "Проект не в эксплуатации — выпуск не исполняется",
+            });
+            return [];
+          }
           if (!res.ok) {
             throw new Error(await res.text().catch(() => "Ошибка загрузки списка сцен"));
           }
 
           const json = await res.json();
+          // Ответ устарел: пока шёл запрос, ушли из монитора (или вернулись в него).
+          if (get().sceneSource !== source) return;
           const list = Array.isArray(json) ? json : [];
-          set({sceneList: list});
+          set({sceneList: list, ...(source === "release" ? {releaseError: null} : {})});
+          if (source === "release") {
+            const release = releaseVersionOf(res);
+            if (release != null) get().setReleaseVersionNo(release);
+          }
+          scheduleScenePrefetch(projectId, list, source);
           return list;
         } catch (err: unknown) {
           console.error(err);
@@ -2671,7 +3716,7 @@ export const useEditorStore = create<EditorState>()(temporal(
           const res = await fetch("/api/editor/projects");
 
           if (!res.ok) {
-            throw new Error(await res.text().catch(() => "Ошибка загрузки списка проектов"));
+            throw new Error(parseBackendErrorMessage(res.status, await res.text().catch(() => "")));
           }
 
           const json = await res.json();
@@ -2681,6 +3726,164 @@ export const useEditorStore = create<EditorState>()(temporal(
         } catch (err: unknown) {
           console.error(err);
           toast.error(getErrorMessage(err, "Ошибка загрузки списка проектов"));
+        }
+      },
+      /**
+       * Флаг эксплуатации живёт отдельным эндпоинтом, поэтому спрашивается точечно.
+       * Ошибку не показываем тостом: это фоновая подробность списка, и её недоступность
+       * не должна выглядеть сбоем — бейдж просто не появится.
+       */
+      loadProjectRuntimeFlag: async (projectId: number) => {
+        try {
+          const res = await fetch(`/api/editor/projects/${projectId}/runtime`);
+          if (!res.ok) return;
+          const info = parseRuntimeInfo(await res.json().catch(() => null));
+          if (!info) return;
+          set(state => ({
+            projectRuntimeFlags: {...state.projectRuntimeFlags, [projectId]: info.inOperation},
+            projectProdVersions: {...state.projectProdVersions, [projectId]: info.prodVersionNo},
+          }));
+        } catch (err: unknown) {
+          console.error(err);
+        }
+      },
+      /**
+       * Ввод и вывод из эксплуатации. Пишем точечно, НЕ через `setCurrentProject`: тот
+       * разрушительный — гасит открытую схему, элементы, список сцен и историю undo.
+       */
+      setProjectInOperation: async (projectId: number, inOperation: boolean) => {
+        const adopt = (info: {inOperation: boolean; prodVersionNo: number | null}) => set(state => ({
+          projectRuntimeFlags: {...state.projectRuntimeFlags, [projectId]: info.inOperation},
+          projectProdVersions: {...state.projectProdVersions, [projectId]: info.prodVersionNo},
+        }));
+        try {
+          let info;
+          try {
+            info = await putInOperation(projectId, inOperation);
+          } catch (err) {
+            // Runtime крутит только prod-выпуск: без него вводить нечего. Предлагаем выпустить
+            // текущий черновик, сделать его prod и повторить — ровно то, чего хотел пользователь.
+            if (!(err instanceof NoProdReleaseError)) throw err;
+            const ok = await confirmModal({
+              title: "У проекта нет prod-выпуска",
+              description: "Монитор и runtime работают только по выпуску. Выпустить текущий "
+                + "сохранённый черновик, сделать его prod и ввести проект в эксплуатацию?"
+                + (hasUnsavedWork() ? " Несохранённые правки открытой схемы в выпуск не попадут." : ""),
+              confirmLabel: "Выпустить и ввести",
+            });
+            if (!ok) return;
+            const release = await createRelease(projectId, "Ввод в эксплуатацию");
+            await setProdRelease(projectId, release.version_no);
+            info = await putInOperation(projectId, inOperation);
+          }
+          adopt(info);
+          toast.success(info.inOperation ? "Проект введён в эксплуатацию" : "Проект выведен из эксплуатации");
+        } catch (err: unknown) {
+          console.error(err);
+          toast.error(getErrorMessage(err, "Ошибка переключения эксплуатации"));
+        }
+      },
+      releaseProject: async (projectId, comment) => {
+        const {scene, currentProject} = get();
+        if (scene && currentProject?.id === projectId && hasUnsavedWork()) {
+          const ok = await confirmModal({
+            title: "Сохранить схему перед выпуском?",
+            description: "Выпуск снимает то, что сохранено на сервере. Несохранённые правки "
+              + "открытой схемы в него не попадут.",
+            confirmLabel: "Сохранить и выпустить",
+          });
+          if (!ok) return null;
+          if (!await get().exportScene({kind: "MANUAL"})) return null;
+        }
+        try {
+          const release = await createRelease(projectId, comment);
+          if (release.unchanged) {
+            toast.info(`Изменений с прошлого выпуска нет — остаётся выпуск №${release.version_no}`);
+          } else {
+            toast.success(`Выпуск №${release.version_no} создан`);
+          }
+          return release;
+        } catch (err) {
+          console.error(err);
+          toast.error(getErrorMessage(err, "Не удалось выпустить проект"));
+          return null;
+        }
+      },
+      makeProdRelease: async (projectId, versionNo) => {
+        try {
+          const info = await setProdRelease(projectId, versionNo);
+          set(state => ({
+            projectRuntimeFlags: {...state.projectRuntimeFlags, [projectId]: info.inOperation},
+            projectProdVersions: {...state.projectProdVersions, [projectId]: info.prodVersionNo},
+          }));
+          toast.success(info.inOperation
+            ? `Выпуск №${versionNo} — prod: проект переключён, мониторы перечитают схемы`
+            : `Выпуск №${versionNo} — prod: заработает при вводе в эксплуатацию`);
+          return true;
+        } catch (err) {
+          console.error(err);
+          toast.error(getErrorMessage(err, "Не удалось сделать выпуск prod"));
+          return false;
+        }
+      },
+      /**
+       * Автопривязка: компонент по своему имени находит объект в базе каналов, а теговое
+       * свойство по своему имени — поле. Совпавшие теги ПЕРЕЗАПИСЫВАЮТСЯ, и каждая
+       * изменённая сцена получает версию `MANUAL` — отменяется это восстановлением
+       * предыдущей версии, а не повторным запросом.
+       */
+      autobindProject: async (projectId: number, channelRoot: string) => {
+        const {scene, currentProject} = get();
+
+        // Автопривязка пишет новую версию сцены: несохранённая правка после неё упрётся в
+        // расхождение версий (слияние или 409). Поэтому спрашиваем ДО запроса.
+        if (scene && currentProject?.id === projectId && hasUnsavedWork()) {
+          const ok = await confirmModal({
+            title: "Сохранить схему перед автопривязкой?",
+            description: "Автопривязка запишет новую версию схемы. Если не сохранить сейчас, "
+              + "текущие правки потом упрутся в расхождение версий.",
+            confirmLabel: "Сохранить и привязать",
+          });
+          if (!ok) return null;
+          if (!await get().exportScene({kind: "MANUAL"})) return null;
+        }
+
+        try {
+          const res = await fetch(`/api/editor/projects/${projectId}/autobind`, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({channel_root: channelRoot}),
+          });
+          if (!res.ok) {
+            // Тело ошибки — `{timestamp, status, error, message}`; сырой JSON в тосте
+            // пользователь читает как «ничего не произошло».
+            throw new Error(parseBackendErrorMessage(res.status, await res.text().catch(() => "")));
+          }
+          const report = await res.json() as AutobindReport;
+
+          // Открытую сцену перечитываем, иначе на холсте останутся прежние теги, а ближайшее
+          // сохранение затрёт автопривязку. Только для текущего проекта: `loadScene` берёт
+          // проект из `currentProject`, и для чужой сцены проверка принадлежности сбросит холст.
+          const openScene = get().scene;
+          if (currentProject?.id === projectId && openScene
+            && report.scenes.some(s => s.scene_id === Number(openScene.id))) {
+            const temporal = useEditorStore.temporal.getState();
+            temporal.pause();
+            try {
+              await get().loadScene(Number(openScene.id), {keepHistory: true});
+            } finally {
+              useEditorStore.temporal.getState().resume();
+            }
+            // Историю чистим: шаг undo вернул бы прежние теги поверх только что проставленных.
+            useEditorStore.temporal.getState().clear();
+          }
+
+          toast.success(`Привязано свойств: ${report.bound}, изменено: ${report.changed}`);
+          return report;
+        } catch (err: unknown) {
+          console.error(err);
+          toast.error(getErrorMessage(err, "Не удалось выполнить автопривязку"));
+          return null;
         }
       },
       createProject: async (name: string) => {
@@ -2708,6 +3911,31 @@ export const useEditorStore = create<EditorState>()(temporal(
           toast.error(getErrorMessage(err, "Ошибка создания проекта"));
         }
       },
+      deleteProject: async (id: number) => {
+        try {
+          // Проект и сцена — один вид компонента, поэтому адрес общий.
+          // Схемы проекта удаляет каскадом бэкенд.
+          //
+          // `based_on_version` не шлём: он проверяется по каждой затронутой СЦЕНЕ, а
+          // проект каскадом уносит их все — одним номером их версии не описать.
+          await deleteComponentsRequest([id]);
+
+          set(state => ({projectList: state.projectList.filter(p => p.id !== id)}));
+
+          // Удалили текущий проект — вместе с ним ушли и все его схемы. Сброс на стороне
+          // клиента уже написан в setCurrentProject: он гасит открытую сцену, elements,
+          // sceneList, буфер обмена, всё версионирование, просмотр версии и историю undo
+          // (иначе Ctrl+Z воскресил бы элементы несуществующего проекта).
+          if (get().currentProject?.id === id) {
+            get().setCurrentProject(null);
+          }
+
+          toast.success("Проект удалён");
+        } catch (err: unknown) {
+          console.error(err);
+          toast.error(getErrorMessage(err, "Ошибка удаления проекта"));
+        }
+      },
       setCurrentProject: (project) => {
         set(() => ({
           currentProject: project,
@@ -2729,8 +3957,13 @@ export const useEditorStore = create<EditorState>()(temporal(
           versionsExhausted: false,
           saveConflict: null,
           staleBaseVersion: null,
+          autosaveError: null,
         }));
         pasteCount = 0;
+        // Координата курсора и точка последней вставки принадлежали прошлой схеме.
+        lastPastePoint = null;
+        stackedPastes = 0;
+        clearCanvasPointerWorld();
         discardVersionPreview();
         // История undo принадлежала прошлому проекту — иначе Ctrl+Z «воскресит» его элементы.
         useEditorStore.temporal.getState().clear();
@@ -2741,6 +3974,11 @@ export const useEditorStore = create<EditorState>()(temporal(
         // просмотра не пересекает.
         discardVersionPreview();
 
+        // Номер вызова: ответ, пришедший после того как пользователь открыл другую
+        // схему, применять нельзя — иначе на холсте окажется не та, что выбрана.
+        const seq = ++sceneLoadSeq;
+        const startedAt = performance.now();
+
         try {
           const {currentProject} = get();
           if (!currentProject) {
@@ -2748,40 +3986,60 @@ export const useEditorStore = create<EditorState>()(temporal(
             set({scene: null, elements: [], selectedIds: [], activeGroupKey: null, selectedTableCell: null, currentComponentStateByElementKey: {}});
             return;
           }
+          const projectId = currentProject.id;
 
-          const res = await fetch(`/api/editor/scene/${id}?project_id=${currentProject.id}`);
-
-          if (!res.ok) {
-            const text = await res.text();
-            throw new Error(`Ошибка ${res.status}: ${text}`);
-          }
-
-          const scene = await res.json();
-
-          // Иерархия: сцена обязана принадлежать выбранному проекту.
-          if (!sceneBelongsToCurrentProject(scene, currentProject)) {
-            toast.error("Сцена не принадлежит выбранному проекту");
-            set({scene: null, elements: [], selectedIds: [], activeGroupKey: null, selectedTableCell: null, currentComponentStateByElementKey: {}});
+          // Попадание в кэш — показываем сразу, свежесть проверяем в фоне (см.
+          // lib/editor/sceneCache.ts). Перечитывание после сохранения (keepHistory) в
+          // кэш не смотрит: ему нужно именно состояние сервера после записи.
+          // Выпуск неизменяем: свежесть не проверяем (смену prod приносит TREE_CHANGED, и
+          // тогда кэш выпуска сбрасывается целиком), номер версии сцены не нужен.
+          const source = get().sceneSource;
+          const isRelease = source === "release";
+          const cached = loadOpts?.keepHistory ? null : getCachedScene(projectId, id, source);
+          if (cached && cached.version !== undefined) {
+            const applyAt = performance.now();
+            if (!applyLoadedScene(cached.scene, cached.version)) return;
+            logSceneTiming(id, "кэш", startedAt, applyAt);
+            if (isRelease) {
+              if (cached.releaseVersion != null) get().setReleaseVersionNo(cached.releaseVersion);
+            } else {
+              void revalidateCachedScene(projectId, id, cached.version, documentGeneration);
+            }
             return;
           }
 
-          set({scene});
-          applyServerComponents(scene?.children ?? [], scene);
-          // Только что загруженная сцена не считается изменённой.
-          // persisted=false: время последнего сейва загрузкой не обновляем.
-          markSceneSaved(false);
+          const {scene, version, releaseVersion} = await fetchSceneWithVersion(
+            projectId, id, {fresh: loadOpts?.keepHistory, source},
+          );
+          if (seq !== sceneLoadSeq || get().sceneSource !== source) return;
 
-          // Версию спрашиваем отдельно и НЕ ждём: без неё редактор работает, а
-          // based_on_version подставится к моменту первого сохранения. Сбрасываем
-          // заранее, чтобы не отправить в новую сцену версию предыдущей.
-          set({
-            sceneVersion: null, versions: [], versionsExhausted: false,
-            saveConflict: null, staleBaseVersion: null,
-          });
-          void get().refreshSceneVersion();
+          const applyAt = performance.now();
+          if (!applyLoadedScene(scene, version ?? null)) return;
+          logSceneTiming(id, "сеть", startedAt, applyAt);
+          if (isRelease) {
+            if (releaseVersion != null) get().setReleaseVersionNo(releaseVersion);
+            set({releaseError: null});
+          } else if (version === undefined) {
+            // Номер не получили — спросим ещё раз в фоне, как раньше: без него редактор
+            // работает, а based_on_version подставится к моменту первого сохранения.
+            void get().refreshSceneVersion();
+          }
 
         } catch (err: unknown) {
+          if (seq !== sceneLoadSeq) return;
           console.error(err);
+          // Монитор: схемы нет в выпуске (например, закреплённая вкладка на схему, которую
+          // ещё не выпустили) — показанную схему не гасим, это не поломка экрана.
+          if (err instanceof SceneLoadError && get().sceneSource === "release") {
+            if (err.status === 404) {
+              toast.error("Этой схемы нет в текущем выпуске проекта");
+              return;
+            }
+            if (err.status === 409) {
+              set({releaseError: "Проект не в эксплуатации — выпуск не исполняется", scene: null, elements: []});
+              return;
+            }
+          }
           toast.error(getErrorMessage(err, "Ошибка загрузки сцены"));
           // Сбрасываем состояние при ошибке, чтобы не показывать данные от предыдущей сцены
           set({scene: null, elements: [], selectedIds: [], activeGroupKey: null, selectedTableCell: null, currentComponentStateByElementKey: {}});
@@ -2793,7 +4051,8 @@ export const useEditorStore = create<EditorState>()(temporal(
           // границу сцены не пересекаем, и чистка здесь означала бы, что любое
           // сохранение (в том числе тихое автосохранение раз в 10 минут) молча
           // стирает весь стек undo/redo пользователя.
-          if (!loadOpts?.keepHistory) {
+          // Устаревший вызов историю не трогает: она уже принадлежит схеме, открытой позже.
+          if (!loadOpts?.keepHistory && seq === sceneLoadSeq) {
             useEditorStore.temporal.getState().clear();
           }
         }
@@ -2803,6 +4062,10 @@ export const useEditorStore = create<EditorState>()(temporal(
           const {currentProject} = get();
           if (!currentProject) {
             toast.error("Сначала выберите проект");
+            return;
+          }
+          if (!canWriteCurrentProject()) {
+            refuseViewOnly();
             return;
           }
 
@@ -2849,6 +4112,7 @@ export const useEditorStore = create<EditorState>()(temporal(
             versionsExhausted: false,
             saveConflict: null,
             staleBaseVersion: null,
+            autosaveError: null,
           });
 
           // Новая сцена — новая точка отсчёта для undo, и просмотр версии прошлой
@@ -2870,16 +4134,22 @@ export const useEditorStore = create<EditorState>()(temporal(
             toast.error("Сначала выберите проект");
             return;
           }
-
-          const res = await fetch(
-            `/api/editor/scene/${id}?project_id=${currentProject.id}`,
-            {method: 'DELETE'},
-          );
-          if (!res.ok) {
-            const text = await res.text();
-            throw new Error(`Ошибка ${res.status}: ${text}`);
+          if (!canWriteCurrentProject()) {
+            refuseViewOnly();
+            return;
           }
+
           const wasCurrent = get().scene?.id === id;
+
+          // Версию берём у той сцены, которую удаляем: открытая знает свою из стора,
+          // за чужой (её удаляют из списка схем, не открывая) идём в историю. Нет
+          // версий вовсе — поле не отправляем, иначе бэкенд ответит 400.
+          const basedOnVersion = wasCurrent
+            ? get().sceneVersion
+            : await fetchCurrentVersion("scenes", id).catch(() => null);
+
+          await deleteComponentsRequest([id], basedOnVersion);
+          dropScene(currentProject.id, id);
 
           set(state => ({
             sceneList: state.sceneList.filter(s => s.id !== id),
@@ -2889,7 +4159,7 @@ export const useEditorStore = create<EditorState>()(temporal(
                   selectedTableCell: null, currentComponentStateByElementKey: {},
                   // Версии удалённой сцены больше ни к чему не относятся.
                   sceneVersion: null, versions: [], versionsExhausted: false,
-                  saveConflict: null, staleBaseVersion: null,
+                  saveConflict: null, staleBaseVersion: null, autosaveError: null,
                 }
               : {}),
           }));
@@ -2958,6 +4228,10 @@ export const useEditorStore = create<EditorState>()(temporal(
           if (isComponentEl(targetGroup)) {
             updatedElements = resplitContainer(updatedElements, targetGroup.key, allMemberKeys);
           }
+
+          // Новые члены получают весь набор состояний контейнера — иначе панель
+          // «Состояния» показывает у них одно состояние против четырёх у компонента.
+          updatedElements = syncMemberStates(updatedElements, targetGroup.key, allMemberKeys);
 
           set({
             elements: updatedElements,
@@ -3044,7 +4318,7 @@ export const useEditorStore = create<EditorState>()(temporal(
         });
       },
       ungroupSelected: async () => {
-        const { elements, selectedIds, activeGroupKey } = get();
+        const { elements, selectedIds, activeGroupKey, scene } = get();
 
         // 1. Находим среди выделенных элементов только группы
         const groupsToUngroup = elements.filter(
@@ -3076,17 +4350,27 @@ export const useEditorStore = create<EditorState>()(temporal(
           const memberKeys = [...(group.children ?? []), ...(group.composition ?? [])];
           newlySelectedIds.push(...memberKeys);
 
+          // parentId «дедушки»: корень сцены → id сцены, группа → её серверный id
+          // (null, если она ещё не сохранена — бэкенд свяжет по parent_key).
+          const grandParentId =
+            grandParentKey === String(scene?.id)
+              ? scene?.id ?? null
+              : (updatedElements.find((el) => el.key === grandParentKey)?.id ?? null);
+
           // Шаг А: Обновляем ВСЕХ членов разбиваемой группы (по parentKey — покрывает
           // и children, и composition). Прибавляем координаты исчезающей группы, причём
           // сдвигаем и базовые поля, и позиционные ключи в overrides состояний:
           // у перемещённого внутри группы листа актуальная позиция живёт в overrides,
           // и сдвиг только базового x/y «телепортирует» его на старое место.
+          // parentId переписываем вместе с parentKey: иначе в нём остаётся серверный id
+          // удалённой группы, и сохранение падает с 400 «Component not found».
           updatedElements = updatedElements.map((el) => {
             if (el.parentKey === groupId) {
               return {
                 ...shiftElementPositions(el, groupX, groupY),
                 // Член переходит под крыло "дедушки" (если группа сама была внутри группы)
                 parentKey: grandParentKey,
+                parentId: grandParentId,
               };
             }
             return el;
@@ -3107,6 +4391,7 @@ export const useEditorStore = create<EditorState>()(temporal(
               ];
               if (isComponentEl(grandParent)) {
                 updatedElements = resplitContainer(updatedElements, grandParentKey, mergedMemberKeys);
+                updatedElements = syncMemberStates(updatedElements, grandParentKey, memberKeys);
               } else {
                 // «Глупая» группа держит всё в children.
                 updatedElements = updatedElements.map((el) =>
@@ -3202,7 +4487,11 @@ export const useEditorStore = create<EditorState>()(temporal(
               return el;
             });
 
-          return {elements: updated, selectedIds: [groupKey]};
+          // Примитивы, ставшие составом компонента, получают его состояния.
+          return {
+            elements: syncMemberStates(updated, groupKey, [...primitiveKeys, ...componentKeys]),
+            selectedIds: [groupKey],
+          };
         });
       },
       disassembleComponent: (componentKey) => {
@@ -3267,6 +4556,7 @@ export const useEditorStore = create<EditorState>()(temporal(
 
         // layoutGroupFromBounds сложил все ключи в children — переразбиваем по роли.
         updatedElements = resplitContainer(updatedElements, targetGroupKey, targetMemberKeys);
+        updatedElements = syncMemberStates(updatedElements, targetGroupKey, targetMemberKeys);
 
         if (oldParentKey && oldParentKey !== targetGroupKey) {
           const oldGroup = updatedElements.find(
@@ -3288,6 +4578,7 @@ export const useEditorStore = create<EditorState>()(temporal(
               scene?.id,
             );
             updatedElements = resplitContainer(updatedElements, oldParentKey, oldMembers);
+            updatedElements = syncMemberStates(updatedElements, oldParentKey, oldMembers);
           }
         }
 

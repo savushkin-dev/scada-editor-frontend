@@ -1,8 +1,13 @@
 import {ChevronLeft, ChevronRight, PanelLeft, PanelRight} from "lucide-react";
 import {PropertiesPanel} from "@/components/editor/PropertiesPanel";
 import {MultiPropertiesPanel} from "@/components/editor/MultiPropertiesPanel";
+import {ScenePropertiesPanel} from "@/components/editor/ScenePropertiesPanel";
 import {LayersPanel} from "@/components/editor/LayersPanel";
 import {useEditorStore} from "@/store/useEditorStore";
+import {openSceneGuarded} from "@/lib/editor/openScene";
+import {SceneTabs} from "@/components/editor/SceneTabs";
+import {useCurrentProjectGrant} from "@/lib/access/projectAccess";
+import {handleTabListKey} from "@/lib/editor/tabListKeys";
 import React, {useMemo, useRef, useState, useEffect} from "react";
 import Palette from "./Palette";
 import ToolsPanel from "@/components/editor/ToolsPanel";
@@ -19,6 +24,11 @@ type LeftTabType = "palette" | "layers";
 
 // Порядок вкладок для навигации стрелками.
 const MAIN_TABS = ["editor", "recipes"] as const satisfies readonly TabType[];
+
+// Вкладки-не-схемы для SceneTabs. На уровне модуля, а не литералом в JSX: новый объект
+// на каждый рендер сбрасывал бы мемоизацию ряда вкладок внутри компонента.
+const RECIPES_TAB = {key: "recipes", label: "Рецепты"} as const;
+const EDITOR_TAB = {key: "editor", label: "Редактор"} as const;
 const LEFT_TABS = ["palette", "layers"] as const satisfies readonly LeftTabType[];
 
 // Ширины боковых панелей: дефолт/максимум/порог, ниже которого перетаскивание края схлопывает панель.
@@ -57,12 +67,15 @@ const readLayout = (): Partial<PersistedLayout> => {
 };
 
 export default function WorkSpace() {
+  // Закрепления — настройка проекта: без права правки вкладки только видны.
+  const canWrite = useCurrentProjectGrant().edit;
   // Точечные селекторы вместо подписки на весь стор: иначе каждый тик пана/зума
   // ре-рендерил WorkSpace и каскадом весь Canvas со всеми фигурами.
   const selectedIds = useEditorStore(s => s.selectedIds);
   const selectedElement = useEditorStore(s => s.elements.find(el => el.key === s.selectedIds[0]));
   const elements = useEditorStore(s => s.elements);
   const isVersionPreview = useEditorStore(s => s.versionPreview !== null);
+  const scene = useEditorStore(s => s.scene);
 
   const selectedElements = useMemo(
     () => selectedIds.map(id => elements.find(el => el.key === id)).filter((el): el is NonNullable<typeof el> => Boolean(el)),
@@ -224,26 +237,22 @@ export default function WorkSpace() {
     }
   };
 
-  /** Стрелки/Home/End внутри полосы вкладок (role="tablist"). */
-  const handleTabListKey = <T extends string>(
-    e: React.KeyboardEvent<HTMLButtonElement>,
-    tabs: readonly T[],
-    current: T,
-    setTab: (t: T) => void,
-  ) => {
-    const idx = tabs.indexOf(current);
-    let next = -1;
-    if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (idx + 1) % tabs.length;
-    else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (idx - 1 + tabs.length) % tabs.length;
-    else if (e.key === "Home") next = 0;
-    else if (e.key === "End") next = tabs.length - 1;
-    if (next < 0) return;
+  const activeTabKey = activeTab === "recipes"
+    ? "recipes"
+    : (scene ? `scene:${scene.id}` : "editor");
 
-    e.preventDefault();
-    setTab(tabs[next]);
-    e.currentTarget.parentElement
-      ?.querySelectorAll<HTMLElement>('[role="tab"]')[next]
-      ?.focus();
+  /** Активирует вкладку по ключу — общий вход для клика и стрелок. */
+  const activateTab = (key: string) => {
+    if (key === "recipes") { setActiveTab("recipes"); return; }
+    if (key === "editor") { setActiveTab("editor"); return; }
+
+    const id = Number(key.slice("scene:".length));
+    if (!Number.isFinite(id)) return;
+    // Своя схема уже открыта — просто показываем холст.
+    if (scene?.id === id) { setActiveTab("editor"); return; }
+    // Чужая: вкладку переключаем только если переход состоялся (могли отказаться
+    // из-за несохранённых правок).
+    void openSceneGuarded(id).then(ok => { if (ok) setActiveTab("editor"); });
   };
 
   // Палитра, свойства, инструменты и Canvas показываются только во вкладке «Редактор».
@@ -268,27 +277,6 @@ export default function WorkSpace() {
       className={cn(
         "flex-1 py-2 text-xs font-semibold uppercase tracking-wide transition-colors",
         leftTab === tab
-          ? "text-blue-600 dark:text-blue-400 border-b-2 border-blue-500"
-          : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200 border-b-2 border-transparent",
-      )}
-    >
-      {title}
-    </button>
-  );
-
-  const tabButton = (tab: TabType, title: string) => (
-    <button
-      id={`workspace-tab-${tab}`}
-      role="tab"
-      type="button"
-      aria-selected={activeTab === tab}
-      aria-controls="workspace-tab-content"
-      tabIndex={activeTab === tab ? 0 : -1}
-      onClick={() => setActiveTab(tab)}
-      onKeyDown={(e) => handleTabListKey(e, MAIN_TABS, activeTab, setActiveTab)}
-      className={cn(
-        "px-3 py-2 text-xs font-semibold uppercase tracking-wide transition-colors whitespace-nowrap",
-        activeTab === tab
           ? "text-blue-600 dark:text-blue-400 border-b-2 border-blue-500"
           : "text-neutral-500 dark:text-neutral-400 hover:text-neutral-800 dark:hover:text-neutral-200 border-b-2 border-transparent",
       )}
@@ -329,26 +317,27 @@ export default function WorkSpace() {
       <main className="absolute inset-0  flex flex-col z-canvas">
         {showEditorPanels && <ToolsPanel />}
 
-        {/* Минимальная полоса вкладок: пока реально готовы только «Редактор» и «Рецепты» —
-            остальные 8 вкладок выше остаются заглушками и закомментированы намеренно.
+        {/* Полоса вкладок — общий компонент с монитором (SceneTabs).
             Отступы обязательны: боковые панели — absolute z-panel поверх main (z-canvas), без
             marginLeft/Right полоса вкладок оказывается под левой панелью и не видна. */}
-        <div
+        <SceneTabs
+          activeKey={activeTabKey}
+          onActivate={activateTab}
+          extraTab={RECIPES_TAB}
+          fallbackTab={EDITOR_TAB}
+          contentId="workspace-tab-content"
+          ariaLabel="Разделы редактора"
+          editable={canWrite}
+          className="transition-[margin] duration-300 ease-in-out"
           style={{ marginLeft: "var(--ws-left-m)", marginRight: "var(--ws-right-m)" }}
-          role="tablist"
-          aria-label="Разделы редактора"
-          className="h-11 shrink-0 border-b border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900/80 backdrop-blur-md flex items-center px-4 gap-2 transition-[margin] duration-300 ease-in-out"
-        >
-          {tabButton("editor", "Редактор")}
-          {tabButton("recipes", "Рецепты")}
-        </div>
+        />
 
         {/* Содержимое вкладки: занимает всё оставшееся место.
             Для «Редактора» — Canvas между панелями; для остальных — чистый элемент вкладки. */}
         <div
           id="workspace-tab-content"
           role="tabpanel"
-          aria-labelledby={`workspace-tab-${activeTab}`}
+          aria-labelledby={`scene-tab-${activeTabKey}`}
           className="flex-1 min-h-0 overflow-hidden bg-white dark:bg-neutral-900"
         >
           {renderTabContent()}
@@ -464,12 +453,9 @@ export default function WorkSpace() {
           ) : selectedElements.length > 1 ? (
             <MultiPropertiesPanel elements={selectedElements} />
           ) : (
-            // items-center без justify-center прижимал сообщение к верхнему краю.
-            <div className="h-full flex flex-col items-center justify-center text-center p-6">
-              <div className="text-neutral-500 dark:text-neutral-400 text-sm font-medium">
-                Выберите элемент на схеме, чтобы изменить его свойства
-              </div>
-            </div>
+            // Ничего не выделено — показываем свойства самой сцены (размер листа).
+            // Подсказка «выберите элемент» переехала в низ этой же панели.
+            <ScenePropertiesPanel />
           )}
         </div>
 

@@ -2,6 +2,11 @@ import {DiagramElement} from "@/types/editorElement.type";
 import {createUuid} from "@/lib/createUuid";
 import {parseBindings} from "@/lib/parseBindings";
 import {parseEvents} from "@/lib/parseEvents";
+import type {PropertyCreateDto} from "@/types/tags.types";
+import type {MonitorMenuSettings, TrendSettings} from "@/types/editorElement.type";
+import {readMonitorMenu} from "@/lib/editor/monitorMenu";
+import {readTrendSettings} from "@/lib/editor/trendSettings";
+import {readMonitorView} from "@/lib/editor/monitorView";
 
 type BackendStateDto = {
   id?: number | string;
@@ -12,17 +17,65 @@ type BackendStateDto = {
 };
 
 type BackendPropertyDto = {
-  id: number;
-  component_id: number;
+  // Необязательные: у DTO шаблона нет id ни на одном уровне (§2 контракта версий),
+  // поэтому свойства шаблона приезжают без номера и владельца — черновиками.
+  id?: number;
+  component_id?: number | null;
   name?: string;
   property_type: string | null;
   tag_id: string | null;
-  description: string | null;
+  label?: string | null;
+  gateway_name?: string | null;
+  /** Устаревшее зеркало gateway_name (до 24.09.2026). Читает только normalizeProperty. */
+  description?: string | null;
   value_type: string | null;
   default_value: string | null;
   logging: boolean;
   onChange: string | null;
 };
+
+/**
+ * Приводит свойство к полям после 24.09.2026: `description` → `gateway_name`.
+ *
+ * Старое имя приходит из трёх мест: ответ бэкенда (пока он отдаёт зеркало), старые
+ * снимки версий и запечённые `composition`-дескрипторы — это блоб фронта, в старых
+ * сценах `description` там останется навсегда. Сам `description` выбрасываем: свойства
+ * уезжают на сервер целиком, и без этого поле ушло бы двумя именами сразу.
+ */
+
+/** `access_level` скрипта: 1…10, иначе `null` (= уровень 1). */
+const parseAccessLevel = (raw: unknown): number | null =>
+  typeof raw === "number" && Number.isInteger(raw) && raw >= 1 && raw <= 10 ? raw : null;
+
+export const normalizeProperty = (raw: unknown): PropertyCreateDto => {
+  const {description, ...rest} = (raw ?? {}) as BackendPropertyDto;
+  return {
+    ...rest,
+    label: rest.label ?? null,
+    gateway_name: rest.gateway_name ?? description ?? null,
+  } as PropertyCreateDto;
+};
+
+/** Ключ добавляется, только если что-то задано: элемент без настроек не несёт пустое поле. */
+const monitorMenuOf = (raw: unknown): {monitorMenu?: MonitorMenuSettings} => {
+  const monitorMenu = readMonitorMenu(raw);
+  return monitorMenu ? {monitorMenu} : {};
+};
+
+/** Зафиксированный вид монитора (служебный элемент листа) — тоже только если задан. */
+const monitorViewOf = (raw: unknown) => {
+  const monitorView = readMonitorView(raw);
+  return monitorView ? {monitorView} : {};
+};
+
+/** Оформление тренда — по тому же правилу: пустое не добавляем. */
+const trendOf = (raw: unknown): {trend?: TrendSettings} => {
+  const trend = readTrendSettings(raw);
+  return trend ? {trend} : {};
+};
+
+const normalizeProperties =(value: unknown): PropertyCreateDto[] =>
+  Array.isArray(value) ? value.map(normalizeProperty) : [];
 
 type ComponentDto = {
   id: number;
@@ -67,7 +120,80 @@ export default function transformElements(
     return [];
   }
 
-  const flattenNode = (el: ComponentDto, fallbackParentId: number | null = null, fallbackParentKey: string | null = null): DiagramElement[] => {
+  /**
+ * Отделяет подпись кнопки от её названия.
+ *
+ * До 30.09.2026 подписью кнопки было поле `label` — то же, что название элемента (дерево слоёв,
+ * `name` на сервере): поля «Название» и «Текст» в панели писали одно и то же, и переименовать
+ * кнопку, не изменив надпись, было нельзя. Теперь подпись — `text`. Старую кнопку приводим к
+ * этому один раз, сохраняя вид: подпись состояния по умолчанию (или название, если своей не
+ * было) уходит в базовый `text`, подписи прочих состояний — в их `text`, а `label` из
+ * overrides убирается — дальше это только название.
+ *
+ * Идемпотентна: кнопка, у которой `text` уже есть в базе или в каком-либо состоянии, не
+ * трогается.
+ */
+const splitButtonCaption = (el: DiagramElement): void => {
+  if (el.type !== "button") return;
+  const base = el as unknown as Record<string, unknown>;
+  const states = el.states ?? [];
+  if (base.text !== undefined || states.some(s => s.overrides && "text" in s.overrides)) return;
+
+  const defaultState = states.find(s => s.isDefault) ?? states[0];
+  const defaultCaption = defaultState?.overrides?.label;
+  base.text = String(defaultCaption ?? base.label ?? "");
+  for (const state of states) {
+    if (!state.overrides || !("label" in state.overrides)) continue;
+    const {label, ...rest} = state.overrides as Record<string, unknown>;
+    state.overrides = state === defaultState ? rest : {...rest, text: label};
+  }
+};
+
+/**
+ * Переводит старую таблицу на привязки ячеек.
+ *
+ * До переработки строкой таблицы считалось свойство с числовым `position`, а рендер
+ * жёстко раскладывал его по колонкам: 0 — номер строки, 1 — имя, 2 — живое значение.
+ * Теперь раскладку задают привязки, и старую схему надо привести к ней, сохранив вид
+ * один в один.
+ *
+ * Идемпотентна: таблица, где уже есть хоть одна привязка ячейки, не трогается.
+ * Номер строки уезжает статикой — за ним не стояло данных, рендер синтезировал его
+ * из индекса цикла.
+ */
+const migrateTableRowBindings = (el: DiagramElement): void => {
+  if (el.type !== "table") return;
+  if ((el.bindings ?? []).some(b => b.cell)) return;
+
+  const rows = (el.properties ?? []).filter(p => typeof p.position === "number");
+  if (!rows.length) return;
+
+  const bindings = [...(el.bindings ?? [])];
+  const cells: Record<string, {value?: string}> = {
+    ...((el as unknown as {cells?: Record<string, {value?: string}>}).cells ?? {}),
+  };
+
+  for (const p of rows) {
+    const row = p.position as number;
+    for (const [col, field] of [[1, "name"], [2, "value"]] as const) {
+      bindings.push({
+        v: 1,
+        id: createUuid(),
+        name: p.name,
+        enabled: true,
+        code: "",
+        cell: {row, col, propertyName: p.name, field},
+      });
+    }
+    // Колонка 0 показывала синтетический номер — закрепляем его текстом.
+    cells[`${row}_0`] = {...(cells[`${row}_0`] ?? {}), value: String(row + 1)};
+  }
+
+  el.bindings = bindings;
+  (el as unknown as {cells?: Record<string, unknown>}).cells = cells;
+};
+
+const flattenNode = (el: ComponentDto, fallbackParentId: number | null = null, fallbackParentKey: string | null = null): DiagramElement[] => {
     // 1. Ensure every element has a truly unique key for the editor session.
     // We cannot rely on api id because it might be 0 or non-unique across different types.
     const elementKey = el.key && el.key !== "0" ? el.key : createUuid();
@@ -77,7 +203,19 @@ export default function transformElements(
     // doesn't shadow the base values that recomputeAncestorBounds updates.
     const GROUP_POSITIONAL_KEYS = new Set(["x", "y", "w", "h", "x1", "y1", "x2", "y2", "radius", "points"]);
     // Структурные ключи компонента в image (не визуальные overrides).
-    const STRUCTURAL_KEYS = new Set(["composition", "isComponent"]);
+    // zIndex — слой отрисовки, живёт в БАЗЕ элемента (см. BASE_ONLY_KEYS в сторе):
+    // оставить его в overrides значило бы, что {...base, ...overrides} на следующем
+    // сохранении вернёт старое значение и правка слоя молча потеряется.
+    // monitorMenu — настройка меню монитора, тоже базовая (BASE_ONLY_KEYS).
+    // trend — оформление тренда (окно, шаг, перья), тоже базовое (BASE_ONLY_KEYS).
+    // monitorView — вид для монитора в служебном элементе листа (setMonitorView пишет в
+    // базу): останься он в overrides, на сохранении {...base, ...overrides} вернул бы старый.
+    // canvas — размер листа в служебном элементе (setSheet пишет в базу). Раньше его здесь
+    // не было, и сохранённая сцена не могла сменить лист: копия из overrides перекрывала
+    // новую базу в {...base, ...overrides} при сохранении, и лист молча откатывался.
+    // optionsWindow — её предшественница (размер окна «Опции», 24–25.09.2026): только
+    // вырезаем, чтобы не осела в overrides; для меню её значения не годятся.
+    const STRUCTURAL_KEYS = new Set(["composition", "isComponent", "zIndex", "monitorMenu", "trend", "monitorView", "canvas", "optionsWindow"]);
 
     // Сырые распарсенные image по каждому состоянию — источник для распаковки composition.
     const rawStateImages = (el.states ?? []).map(s => parseStateImage(s.image));
@@ -139,7 +277,7 @@ export default function transformElements(
         const d = compArr[i] ?? desc;
         // scripts/bindings/properties/events — данные примитива, не визуальные overrides.
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { type: _t, key: _k, scripts: _s, bindings: _b, properties: _p, events: _e, ...overrides } = d;
+        const { type: _t, key: _k, scripts: _s, bindings: _b, properties: _p, events: _e, zIndex: _z, monitorMenu: _mm, trend: _tr, optionsWindow: _ow, ...overrides } = d;
         return {
           id: createUuid(),
           name: cs.name,
@@ -161,6 +299,10 @@ export default function transformElements(
         h: toFiniteNumber(primOverrides.h, 80),
         composition: [],
         ...primOverrides,
+        // Слой примитива — в базу, а не в overrides (симметрия с buildShapeDescriptor).
+        zIndex: toFiniteNumber(desc.zIndex, 0),
+        ...monitorMenuOf(desc.monitorMenu),
+        ...trendOf(desc.trend),
         states: primStates.length
           ? primStates
           : [{ id: createUuid(), name: "Нормальное", overrides: {}, isDefault: true }],
@@ -173,17 +315,20 @@ export default function transformElements(
           id: s.id != null ? String(s.id) : createUuid(),
           name: String(s.name ?? ""),
           content: String(s.content ?? s.script ?? ""),
+          displayed: Boolean(s.displayed),
+          accessLevel: parseAccessLevel(s.accessLevel ?? s.access_level),
         })),
         // Composition-дескриптор хранит TagBinding[] сырыми объектами; parseBindings
         // заодно отсеивает легаси-мусор (симметрия с buildShapeDescriptor).
         bindings: parseBindings(desc.bindings),
-        properties: normalizeArray(desc.properties as unknown[]) as DiagramElement["properties"],
+        properties: normalizeProperties(desc.properties),
         ...(desc.events ? {events: parseEvents(desc.events)} : {}),
         label: String(desc.label ?? ""),
       } as DiagramElement);
 
       compositionKeys.push(primKey);
     });
+    compositionElements.forEach(splitButtonCaption);
 
     const flattenedElement = {
       id: el.id,
@@ -195,6 +340,16 @@ export default function transformElements(
       w: toFiniteNumber(defaultRawImage.w, 80),
       h: toFiniteNumber(defaultRawImage.h, 80),
       ...(image || {}),
+      // Слой берём из НЕобрезанного image: из overrides он вырезан как структурный.
+      zIndex: toFiniteNumber(defaultRawImage.zIndex, 0),
+      // Настройки меню монитора — тоже из необрезанного image: из overrides они вырезаны.
+      ...monitorMenuOf(defaultRawImage.monitorMenu),
+      ...trendOf(defaultRawImage.trend),
+      ...monitorViewOf(defaultRawImage.monitorView),
+      // Блок листа (данные CONTUR: width/height/units/grid/…) — целиком, как пришёл.
+      ...(defaultRawImage.canvas && typeof defaultRawImage.canvas === "object"
+        ? {canvas: defaultRawImage.canvas}
+        : {}),
       composition: compositionKeys,
       isComponent: isComponentFlag,
       states: normalizedStates,
@@ -208,6 +363,11 @@ export default function transformElements(
         ...(typeof s.id === "number" || typeof s.id === "string" ? {serverId: s.id} : {}),
         name: String(s.name ?? ""),
         content: String(s.content ?? s.script ?? ""),
+        // Пункт меню монитора. Список полей здесь — белый: чего нет в нём, то
+        // теряется при загрузке, поэтому новое поле контракта добавляется тут.
+        displayed: Boolean(s.displayed),
+        // Уровень доступа скрипта: без него в мониторе кнопка считалась бы уровнем 1.
+        accessLevel: parseAccessLevel(s.access_level),
       })),
       // Top-level биндинги едут через DTO-обёртку {name, script: JSON} — распаковываем.
       bindings: parseBindings(el.bindings),
@@ -215,7 +375,7 @@ export default function transformElements(
       // Для type==="table" это же поле несёт привязки строк к тегам (property_type
       // "TAG:<row>", см. src/lib/editor/rowBinding.ts) — номер строки едет внутри
       // property_type, реконструкция позиции по индексу массива не нужна.
-      properties: Array.isArray(el.properties) ? el.properties : [],
+      properties: normalizeProperties(el.properties),
       label: el.name,
     };
 
@@ -239,6 +399,9 @@ export default function transformElements(
     });
 
     flattenedElement.children = childKeys;
+
+    migrateTableRowBindings(flattenedElement as unknown as DiagramElement);
+    splitButtonCaption(flattenedElement as unknown as DiagramElement);
 
     return [
       flattenedElement as DiagramElement,

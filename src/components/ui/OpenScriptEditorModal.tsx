@@ -1,20 +1,26 @@
 import {useModalStore} from "@/store/modalStore";
 import {cn} from "@/lib/utils";
-import React, {useId, useState, useEffect} from "react";
+import React, {useId, useState, useEffect, useMemo} from "react";
 import CodeMirror from '@uiw/react-codemirror';
-import {java} from "@codemirror/lang-java";
+import {javascript} from "@codemirror/lang-javascript";
 import {Wand2} from "lucide-react";
 import {formatCode} from "@/lib/formatCode";
 import {TitleWithHint} from "./codeModalParts";
 import { Button, ModalFooter } from "@/components/ui/Button";
+import {checkScriptSyntax} from "@/lib/runtime/scriptSyntax";
+import {AccessLevelSelect} from "@/components/ui/AccessLevelSelect";
 
 interface ScriptModalProps {
   title: string;
   description: string;
   defaultName?: string;
   defaultContent?: string;
+  /** Показывать ли скрипт пунктом меню в мониторе (ElementScript.displayed). */
+  defaultDisplayed?: boolean;
+  /** Уровень доступа скрипта в мониторе (ElementScript.accessLevel); null — уровень 1. */
+  defaultAccessLevel?: number | null;
   confirmLabel?: string;
-  onConfirm: (name: string, content: string) => void | Promise<void>;
+  onConfirm: (name: string, content: string, displayed: boolean, accessLevel: number | null) => void | Promise<void>;
 }
 
 export function ScriptEditorModalContent({
@@ -22,26 +28,39 @@ export function ScriptEditorModalContent({
   description,
   defaultName = "",
   defaultContent = "",
+  defaultDisplayed = false,
+  defaultAccessLevel = null,
   confirmLabel = "Сохранить",
   onConfirm,
 }: ScriptModalProps) {
   const closeModal = useModalStore((s) => s.closeModal);
   const [name, setName] = useState(defaultName);
   const [content, setContent] = useState(defaultContent);
+  const [displayed, setDisplayed] = useState(defaultDisplayed);
+  const [accessLevel, setAccessLevel] = useState<number | null>(defaultAccessLevel);
   const [isLoading, setIsLoading] = useState(false);
   const inputId = useId();
+  const displayedId = useId();
+  const accessLevelId = useId();
 
   useEffect(() => {
     setName(defaultName);
     setContent(defaultContent);
-  }, [defaultName, defaultContent]);
+    setDisplayed(defaultDisplayed);
+    setAccessLevel(defaultAccessLevel);
+  }, [defaultName, defaultContent, defaultDisplayed, defaultAccessLevel]);
+
+  // Бэкенд отклонит всю сцену со скриптом, который не разбирается (контракт 25.09.2026),
+  // поэтому битый код не даём сохранить здесь — автор видит ошибку сразу, а не при
+  // сохранении схемы одним сообщением на все её скрипты.
+  const syntaxError = useMemo(() => checkScriptSyntax(content), [content]);
 
   const handleConfirmAction = async () => {
-    if (!name?.trim() || !content?.trim()) return;
+    if (!name?.trim() || !content?.trim() || syntaxError) return;
 
     setIsLoading(true);
     try {
-      await onConfirm(name, content);
+      await onConfirm(name, content, displayed, accessLevel);
       closeModal();
     } catch (error) {
       console.error("Confirm error:", error);
@@ -74,10 +93,44 @@ export function ScriptEditorModalContent({
         />
       </div>
 
+      {/* Помеченный скрипт становится пунктом меню компонента в мониторе
+          (ПКМ по компоненту) — оператор запускает его вручную, не дожидаясь
+          события. Непомеченный по-прежнему вызывается только из обработчика
+          события через runScript("Имя"). */}
+      <div className="shrink-0">
+        <label
+          htmlFor={displayedId}
+          className="flex items-center gap-2.5 cursor-pointer select-none text-sm text-gray-700 dark:text-gray-200"
+        >
+          <input
+            id={displayedId}
+            type="checkbox"
+            checked={displayed}
+            onChange={(e) => setDisplayed(e.target.checked)}
+            className="h-4 w-4 rounded border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-indigo-600 focus:ring-indigo-500"
+          />
+          Добавить действие в монитор?
+          <span className="text-xs text-gray-500 dark:text-gray-400">
+            (пункт в меню компонента по правому клику)
+          </span>
+        </label>
+      </div>
+
+      {/* Уровень оператора, которому монитор разрешит запуск (кнопка, пункт меню,
+          runScript). Проверяет сервер по prod-выпуску, поэтому новый уровень начинает
+          действовать только после выпуска и назначения его prod. */}
+      <div className="shrink-0 flex items-center gap-2.5 text-sm text-gray-700 dark:text-gray-200">
+        <label htmlFor={accessLevelId}>Уровень доступа</label>
+        <AccessLevelSelect id={accessLevelId} value={accessLevel} onChange={setAccessLevel} />
+        <span className="text-xs text-gray-500 dark:text-gray-400">
+          (оператор с уровнем ниже не сможет запустить скрипт; действует после выпуска и prod)
+        </span>
+      </div>
+
       <div className="flex-1 min-h-0 flex flex-col">
         <div className="flex items-center justify-between mb-1 ml-1">
           <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider">
-            Код скрипта (Java)
+            Код скрипта (JavaScript)
           </label>
           <button
             type="button"
@@ -94,11 +147,16 @@ export function ScriptEditorModalContent({
             value={content}
             height="100%"
             className="h-full text-sm"
-            extensions={[java()]}
+            extensions={[javascript()]}
             onChange={(value) => setContent(value)}
             theme="dark"
           />
         </div>
+        {syntaxError && (
+          <div role="alert" className="mt-2 ml-1 text-sm text-red-600 dark:text-red-400">
+            Синтаксическая ошибка: {syntaxError}
+          </div>
+        )}
       </div>
 
       <ModalFooter className="shrink-0 mt-0">
@@ -106,7 +164,8 @@ export function ScriptEditorModalContent({
         <Button
           variant="primary"
           onClick={handleConfirmAction}
-          disabled={!name.trim() || !content.trim() || isLoading}
+          disabled={!name.trim() || !content.trim() || Boolean(syntaxError) || isLoading}
+          title={syntaxError ? "Исправьте синтаксическую ошибку в коде" : undefined}
         >
           {isLoading ? "Загрузка..." : confirmLabel}
         </Button>

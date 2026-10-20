@@ -1,12 +1,16 @@
 import { useShallow } from "zustand/react/shallow";
 import { useEditorStore } from "@/store/useEditorStore";
 import { getElementIndex } from "@/lib/editor/elementIndex";
-import { DiagramElement } from "@/types/editorElement.type";
+import { DiagramElement, GroupElement } from "@/types/editorElement.type";
+import { sortKeysByZIndex } from "@/lib/editor/zOrder";
 
 /** Типы со своими специализированными ручками — Transformer к ним не цепляем. */
 // Дуга — со своими ручками (начало/раствор/радиус), рамка Transformer'а ей не нужна:
 // её масштабирование записало бы w/h в обход `radius`, который читает рендер.
-export const NON_TRANSFORMABLE = new Set(["group", "text", "circle", "arc", "line", "polygon"]);
+// Таблица — со своими ручками габарита и границ полос (TableResizeHandles): Transformer
+// масштабирует узел императивно, растягивая кегль, линии сетки и текст ячеек до самого
+// отпускания, и коммитит `rotate`, который рендер таблицы не применяет.
+export const NON_TRANSFORMABLE = new Set(["group", "text", "circle", "arc", "curve", "line", "polygon", "table"]);
 
 export interface ElementRenderState {
   /** Сам элемент (undefined — удалён из схемы). */
@@ -69,4 +73,55 @@ export function useElementRenderState(elementKey: string): ElementRenderState {
       runtime: s.runtimeOverridesByElementKey[elementKey],
     };
   }));
+}
+
+/**
+ * Ключи состава контейнера в порядке отрисовки: composition + children, отсортированные
+ * по `zIndex`.
+ *
+ * Отдельная подписка, а не данные из `EditorRenderContext`: в контексте состава схемы
+ * намеренно нет (см. types.ts), иначе ломается мемоизация узлов. `useShallow` сравнивает
+ * массив по содержимому — группа перерисовывается только когда порядок реально изменился.
+ *
+ * composition и children сортируются ОДНИМ пулом: внутри контейнера это соседи, и z-index
+ * должен работать между ними. Прежнее правило «примитивы под детьми» остаётся поведением
+ * по умолчанию — при равных `zIndex` стабильная сортировка сохраняет порядок конкатенации.
+ */
+export function useOrderedMemberKeys(group: GroupElement): string[] {
+  return useEditorStore(useShallow(s =>
+    sortKeysByZIndex(
+      [...(group.composition ?? []), ...group.children],
+      getElementIndex(s.elements).byKey,
+    ),
+  ));
+}
+
+/**
+ * Слушает ли состав контейнера события мыши.
+ *
+ * Содержимое группы недоступно, пока в группу не вошли двойным кликом: иначе вложенная
+ * фигура перехватывает клик и двойной клик у самой группы (кружок открывал правку надписи
+ * вместо входа в группу — он гасит всплытие раньше, чем событие дойдёт до `GroupNode`),
+ * и её можно утащить из группы, не открыв её.
+ *
+ * Условие — «активная область в этой группе ИЛИ глубже». Проверка предка обязательна:
+ * без неё вход во вложенную группу выключил бы состав внешней, а вместе с ним и саму
+ * вложенную — `listening: false` у контейнера Konva гасит всё поддерево.
+ *
+ * Отдельный хук, а не поле `useElementRenderState`: тот вызывается для КАЖДОГО узла, и
+ * обход предков на каждом листе — лишняя работа. Возвращает булево, поэтому подписка
+ * перерисовывает только те группы, у которых флаг реально изменился.
+ */
+export function useMembersInteractive(groupKey: string): boolean {
+  return useEditorStore(s => {
+    const active = s.activeGroupKey;
+    if (!active) return false;
+    if (active === groupKey) return true;
+
+    const {byKey} = getElementIndex(s.elements);
+    for (let key = byKey[active]?.parentKey; key; key = byKey[key]?.parentKey) {
+      if (key === groupKey) return true;
+    }
+    return false;
+  });
 }

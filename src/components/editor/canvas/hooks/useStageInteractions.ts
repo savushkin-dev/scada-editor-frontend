@@ -2,14 +2,17 @@ import { RefObject, useEffect, useRef, useState } from "react";
 import Konva from "konva";
 import { resetCanvasCursor } from "@/lib/editor/canvasCursor";
 import { useEditorStore } from "@/store/useEditorStore";
+import { setCanvasPointerWorld } from "@/lib/editor/canvasPointer";
 import { DiagramElement } from "@/types/editorElement.type";
 import isIntersecting from "@/lib/isIntersecting";
 import { getSelectionBounds } from "@/lib/editor/getSelectionBounds";
+import { ZOOM_MIN, ZOOM_MAX } from "@/lib/editor/zoomLimits";
+import { getElementIndex } from "@/lib/editor/elementIndex";
+import { pickMonitorTarget } from "@/lib/editor/pickMonitorTarget";
+import { cameraForMonitorView, resolveMonitorView } from "@/lib/editor/monitorView";
+import { resolveSheet } from "@/lib/editor/sheet";
 import type { SelectionRect } from "../types";
 
-/** Тот же клэмп зума, что и в ZoomControls. */
-const ZOOM_MIN = 0.2;
-const ZOOM_MAX = 3;
 
 /**
  * Приводит колесо к пикселям. `deltaMode` бывает LINE (Firefox) и PAGE, и без
@@ -23,6 +26,14 @@ const normalizeWheelDelta = (e: WheelEvent): {deltaX: number; deltaY: number} =>
     : 1;
   return {deltaX: e.deltaX * factor, deltaY: e.deltaY * factor};
 };
+
+/**
+ * Монитор с зафиксированным видом (lib/editor/monitorView.ts): камера стоит, как её
+ * выставил инженер, а оператору доступна только прокрутка колесом по вертикали.
+ * В редакторе замок на камеру не действует — всегда null.
+ */
+const lockedMonitorView = (readOnly: boolean) =>
+  readOnly ? resolveMonitorView(useEditorStore.getState().elements) : null;
 
 interface StageInteractionsDeps {
   stageRef: RefObject<Konva.Stage | null>;
@@ -71,6 +82,8 @@ export function useStageInteractions({
   useEffect(() => {
     const onMouseMove = (e: MouseEvent) => {
       if (!middlePanRef.current) return;
+      // Вид зафиксировали, пока тянули, — жест обрываем, а не двигаем закреплённую камеру.
+      if (lockedMonitorView(readOnly)) { middlePanRef.current = null; return; }
       const dx = e.clientX - middlePanRef.current.x;
       const dy = e.clientY - middlePanRef.current.y;
       middlePanRef.current = { x: e.clientX, y: e.clientY };
@@ -91,7 +104,7 @@ export function useStageInteractions({
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
     };
-  }, [stageRef]);
+  }, [stageRef, readOnly]);
 
   const handleWheel = (e: Konva.KonvaEventObject<WheelEvent>) => {
     e.evt.preventDefault();
@@ -101,6 +114,21 @@ export function useStageInteractions({
     // Firefox отдаёт deltaMode=DOM_DELTA_LINE (deltaY≈3), Chrome — PIXEL (≈100).
     // Без нормализации в Firefox холст пролистывался по 3px, а зум был незаметен.
     const { deltaX, deltaY } = normalizeWheelDelta(e.evt);
+
+    // Зафиксированный вид монитора: только вертикальная прокрутка в пределах листа.
+    // Ctrl+колесо и пинч (браузер шлёт его как wheel с ctrlKey) не зумят, Shift и
+    // горизонталь тачпада не двигают вбок. `preventDefault` выше снимать НЕЛЬЗЯ: без него
+    // Ctrl+колесо достанется браузеру и начнёт масштабировать саму страницу.
+    const locked = lockedMonitorView(readOnly);
+    if (locked) {
+      if (e.evt.ctrlKey || !deltaY) return;
+      const { camera: cam, canvasRect, elements: els } = useEditorStore.getState();
+      if (!canvasRect) return;
+      const top = -cam.y / cam.zoom + deltaY / cam.zoom;
+      const next = cameraForMonitorView(locked, resolveSheet(els), canvasRect, top);
+      if (next.y !== cam.y) useEditorStore.getState().setCamera(next.x, next.y, next.zoom);
+      return;
+    }
 
     if (e.evt.ctrlKey) {
       // Ctrl + Wheel → zoom to cursor point
@@ -177,6 +205,8 @@ export function useStageInteractions({
     // поверх жеста.
     if (e.evt instanceof MouseEvent && e.evt.button === 1) {
       e.evt.preventDefault();
+      // Зафиксированный вид монитора не панорамируют — только колесо по вертикали.
+      if (lockedMonitorView(readOnly)) return;
       middlePanRef.current = { x: e.evt.clientX, y: e.evt.clientY };
       const container = stageRef.current?.container();
       if (container) container.style.cursor = "grabbing";
@@ -188,8 +218,23 @@ export function useStageInteractions({
     if (useEditorStore.getState().pendingPlacement) return;
 
     // Монитор: клики по холсту ничего не выделяют и не рисуют маркиз
-    // (средняя кнопка — панорамирование — обработана выше).
-    if (readOnly) return;
+    // (средняя кнопка — панорамирование — обработана выше). Единственное исключение —
+    // выход на уровень вверх кликом по пустому месту: внутрь составного компонента там
+    // заходят двойным кликом, и обратная дорога должна быть той же, что в редакторе.
+    if (readOnly) {
+      if (!activeGroupKey) return;
+      // Именно свой хит-тест, а не `clickedOnEmpty`: в мониторе основной слой не
+      // слушает, и клик по фигуре тоже приходит на Stage — по e.target выход из группы
+      // случался бы при клике по её же содержимому.
+      const pos = stageRef.current?.getRelativePointerPosition();
+      const hit = pos && pickMonitorTarget(pos, {
+        elementIndex: getElementIndex(elements),
+        activeGroupKey,
+        sceneId: String(useEditorStore.getState().scene?.id ?? ""),
+      });
+      if (!hit) exitGroup();
+      return;
+    }
 
     // Нажатие по фигуре — выделяем её (см. selectOnPress) и на этом всё:
     // маркиз стартует только с пустого места.
@@ -220,6 +265,18 @@ export function useStageInteractions({
   };
 
   const handleStageMouseMove = () => {
+    // Позиция курсора в мировых координатах — для вставки «сюда» (Ctrl+V и пункт меню).
+    // Пишем в модульную переменную, а не в стор: на каждый mousemove запись в стор
+    // перерисовывала бы всю сцену (см. canvasPointer.ts).
+    const stage = stageRef.current;
+    const pointer = stage?.getPointerPosition();
+    if (stage && pointer) {
+      setCanvasPointerWorld({
+        x: (pointer.x - stage.x()) / stage.scaleX(),
+        y: (pointer.y - stage.y()) / stage.scaleX(),
+      });
+    }
+
     if (selectionRect && stageRef.current) {
       const pos = stageRef.current.getPointerPosition();
       if (pos) {

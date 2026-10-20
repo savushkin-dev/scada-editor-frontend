@@ -15,11 +15,20 @@ export function ButtonShapeElement({ el, isSelected, onElementClick, updateEleme
   const h = rendered.h || 40;
   const color = rendered.color || "#3b82f6";
   const textColor = rendered.textColor || "#ffffff";
-  const label = rendered.label ?? "Кнопка";
+  // Подпись — `text`, независимо от названия элемента (`label`). `label` остаётся запасным:
+  // кнопка из JSON-импорта может прийти без `text`, а скрипт монитора, написанный под старую
+  // схему, меняет надпись через setProp("label", …) — такая запись по-прежнему видна.
+  const rt = runtime as { text?: unknown; label?: unknown } | undefined;
+  const caption = rt?.text ?? rt?.label ?? (rendered as { text?: unknown }).text ?? rendered.label ?? "Кнопка";
+  const label = String(caption);
   const rx = rendered.rx ?? 6;
   const pressed = !!rendered.pressed;
   const enabled = rendered.enabled !== false;
-  const fontSize = Math.max(11, Math.min(18, Math.floor(h * 0.4)));
+  // Размер задаётся в панели свойств. У кнопок, созданных до этой настройки, его нет —
+  // для них остаётся прежний расчёт от высоты, чтобы старые схемы не поменялись.
+  const fontSize = typeof rendered.fontSize === "number"
+    ? Math.max(8, Math.min(72, rendered.fontSize))
+    : Math.max(11, Math.min(18, Math.floor(h * 0.4)));
 
   return (
     <Group

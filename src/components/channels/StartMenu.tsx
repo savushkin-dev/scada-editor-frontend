@@ -1,11 +1,11 @@
 import {useEffect, useId, useState} from "react";
 import {useDeviceStore} from "@/store/useDeviceStore";
-import {unsubscribeDeviceTree} from "@/shared/websocket/wsSubscriptions";
 import {
   Search, Building2, FolderOpen, AlertCircle,
-  RefreshCw, Check,
+  RefreshCw, Check, FileUp,
 } from 'lucide-react';
 import {MultiSelect} from "@/components/ui/MultiSelect";
+import {openImportCdbxModal} from "@/components/channels/OpenImportCdbxModal";
 
 export default function StartMenu() {
   // Состояния для MultiSelect
@@ -25,19 +25,9 @@ export default function StartMenu() {
   const projectsLabelId = useId();
 
   const [error, setError] = useState<string | null>(null);
-  const [activeSubscriptions, setActiveSubscriptions] = useState<{ site: string; project: string }[]>([]);
 
   const { loadNodes, nodes, getParamsTypes } = useDeviceStore();
   const hasData = nodes.length > 0;
-
-  // Отписка при размонтировании
-  useEffect(() => {
-    return () => {
-      activeSubscriptions.forEach(sub => {
-        unsubscribeDeviceTree(sub.site, sub.project);
-      });
-    };
-  }, [activeSubscriptions]);
 
   // 1. Загрузка списка площадок
   useEffect(() => {
@@ -146,24 +136,8 @@ export default function StartMenu() {
     setError(null);
 
     try {
-      // Отписываемся от старых подписок
-      activeSubscriptions.forEach(sub => {
-        unsubscribeDeviceTree(sub.site, sub.project);
-      });
-
-      // ВАЖНО: Тебе нужно будет обновить метод loadNodes в useDeviceStore, 
-      // чтобы он принимал массивы string[], а не просто string.
-      // @ts-ignore (пока loadNodes не обновлен в сторе)
       await loadNodes(selectedProjects);
       await getParamsTypes();
-
-      // Сохраняем новые подписки (упрощенная логика формирования пар site-project)
-      const newSubscriptions = selectedProjects.map(p => ({
-        site: selectedSites[0], // ВНИМАНИЕ: Здесь нужно правильно сопоставить проект и его площадку
-        project: p
-      }));
-
-      setActiveSubscriptions(newSubscriptions);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Неизвестная ошибка';
       setError(
@@ -264,6 +238,17 @@ export default function StartMenu() {
                   Загрузить устройства
                 </>
               )}
+            </button>
+
+            {/* Импорт создаёт НОВЫЙ проект, поэтому стоит рядом с выбором: после отчёта он
+                сам подгружается в дерево и виден в этом же списке проектов. */}
+            <button
+              type="button"
+              onClick={openImportCdbxModal}
+              className="w-full py-4 rounded-2xl border-2 border-dashed border-indigo-300 dark:border-indigo-700/80 text-indigo-700 dark:text-indigo-300 font-bold hover:bg-indigo-50 dark:hover:bg-indigo-950/40 transition-all flex items-center justify-center gap-3"
+            >
+              <FileUp className="w-5 h-5" />
+              Импорт базы из .cdbx
             </button>
           </form>
         </div>

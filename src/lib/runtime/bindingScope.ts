@@ -12,7 +12,9 @@ const RESERVED_WORDS = new Set([
   "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while",
   "with", "yield", "let", "static", "await", "arguments", "eval",
   // имена API движка — заняты аргументами компилируемой функции
-  "setState", "setProp", "self", "setProperty", "runScript",
+  "setState", "setProp", "self", "setProperty", "runScript", "openScene", "showMenu",
+  // объект исходных строк значений: RAW.ИмяСвойства
+  "RAW",
 ]);
 
 /** Валидный JS-идентификатор (кириллица допустима: \p{L}); не зарезервирован. */
@@ -33,6 +35,93 @@ export const uniqueVarName = (raw: string, taken: ReadonlySet<string>): string =
   return name;
 };
 
+/** Символ-«хвост» незакрытой строки/комментария — до конца кода. */
+const CLOSERS: Record<string, string> = {'"': '"', "'": "'", "`": "`"};
+
+const isIdentStart = (ch: string) => /[\p{L}_$]/u.test(ch);
+const isIdentPart = (ch: string) => /[\p{L}\p{N}_$]/u.test(ch);
+
+/**
+ * Переводит код со старого синтаксиса на новый: `Имя.V` → `Имя`, `Имя.RAW` → `RAW.Имя`.
+ *
+ * Раньше в скоуп подставлялся объект `{V, RAW}`, и до значения приходилось идти через
+ * точку. Точка и путала: `ST` читалось как имя тега, а `.V` — как часть его пути, хотя
+ * `ST` — это имя СВОЙСТВА, а `.V` — поле обёртки. Обёртку убрали, но код уже сохранённых
+ * схем никуда не делся, и молча сломаться он не должен: `ST.V` на числе даёт `undefined`,
+ * а `undefined > 100` — это тихое «условие не выполняется никогда», худший из возможных
+ * исходов на мнемосхеме.
+ *
+ * Применяется при компиляции (рантайм) и при открытии редактора — там же и сохраняется.
+ * Идемпотентно: у `Имя` без точки и у `RAW.Имя` переписывать нечего.
+ *
+ * Разбор посимвольный, а не регуляркой: строки, шаблонные строки и комментарии надо
+ * пропускать целиком (`setProp("ST.V", 1)` обязан остаться как есть), а незакрытая
+ * кавычка в недописанном коде не должна утаскивать за собой остаток файла.
+ */
+export const modernizeScopeCode = (code: string, names: readonly string[]): string => {
+  if (!code || !names.length) return code;
+
+  const scope = new Set(names);
+  let out = "";
+  let i = 0;
+
+  while (i < code.length) {
+    const ch = code[i];
+
+    // Строка/шаблон — до закрывающей кавычки, с учётом экранирования.
+    if (CLOSERS[ch]) {
+      const quote = CLOSERS[ch];
+      let j = i + 1;
+      while (j < code.length && code[j] !== quote) j += code[j] === "\\" ? 2 : 1;
+      out += code.slice(i, Math.min(j + 1, code.length));
+      i = j + 1;
+      continue;
+    }
+
+    // Комментарии — до конца строки / до `*/`.
+    if (ch === "/" && code[i + 1] === "/") {
+      const end = code.indexOf("\n", i);
+      out += code.slice(i, end === -1 ? code.length : end);
+      i = end === -1 ? code.length : end;
+      continue;
+    }
+    if (ch === "/" && code[i + 1] === "*") {
+      const end = code.indexOf("*/", i + 2);
+      out += code.slice(i, end === -1 ? code.length : end + 2);
+      i = end === -1 ? code.length : end + 2;
+      continue;
+    }
+
+    if (!isIdentStart(ch)) {
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    let j = i + 1;
+    while (j < code.length && isIdentPart(code[j])) j += 1;
+    const name = code.slice(i, j);
+    i = j;
+
+    // Не наша переменная, либо `obj.ST` — поле чужого объекта.
+    if (!scope.has(name) || out.replace(/\s+$/, "").endsWith(".")) {
+      out += name;
+      continue;
+    }
+
+    const field = /^\s*\.\s*(V|RAW)(?![\p{L}\p{N}_$])/u.exec(code.slice(i));
+    if (!field) {
+      out += name;
+      continue;
+    }
+
+    out += field[1] === "V" ? name : `RAW.${name}`;
+    i += field[0].length;
+  }
+
+  return out;
+};
+
 export interface TagScope {
   /** Имена переменных скоупа в фиксированном порядке (порядок аргументов fn): сначала теги, затем свойства объектов. */
   names: string[];
@@ -51,22 +140,11 @@ export interface TagScope {
  * 16.07.2026: "Binding requires component_property_id" / "does not belong to component X").
  * UI обязан блокировать сохранение биндинга, пока это не так.
  */
-export const hasSavedTagProperty = (properties: PropertyCreateDto[] | undefined): boolean =>
-  (properties ?? []).some(p => p.property_type === "Тег" && typeof p.id === "number");
-
-/**
- * У элемента есть хотя бы одно СОХРАНЁННОЕ на сервере свойство ЛЮБОГО типа (числовой id).
- * Нужно для гейта сохранения биндинга, ссылающегося только на свойства других
- * компонентов: `component_property_id` в DTO обязан ссылаться на существующее
- * свойство самого элемента (см. hasSavedTagProperty), но для этого годится и
- * не-тег свойство (проверить на бэкенде — см. план, Risks).
- */
-export const hasSavedProperty = (properties: PropertyCreateDto[] | undefined): boolean =>
-  (properties ?? []).some(p => typeof p.id === "number");
 
 /**
  * Скоуп биндинга: свойства-теги элемента (`property_type === "Тег"`, tag_id непустой).
- * Имя каждого свойства становится переменной в коде биндинга: `Test.V > 100`.
+ * Имя каждого свойства становится переменной в коде биндинга, и переменная — это САМО
+ * значение: `Test > 100`. Исходная строка доступна как `RAW.Test`.
  */
 export const collectTagScope = (properties: PropertyCreateDto[] | undefined): TagScope => {
   const names: string[] = [];

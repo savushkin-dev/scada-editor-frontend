@@ -2,7 +2,23 @@ import {absolutePosition} from "@/lib/getAbsolutePosition";
 import {DiagramElement, LeafElement} from "@/types/editorElement.type";
 import {getRenderedElement} from "@/lib/getRenderedElement";
 import {ElementIndex, getChildElements, getElementIndex} from "@/lib/editor/elementIndex";
+import {measureText} from "@/lib/editor/measureText";
 
+/**
+ * Габарит элемента И его начало координат — это РАЗНЫЕ вещи, и путать их нельзя.
+ *
+ * - `minX/minY/maxX/maxY` — видимый габаритный прямоугольник в мировых координатах.
+ * - `absX/absY` — НАЧАЛО КООРДИНАТ элемента, то есть его `x/y`, поднятые до мировых.
+ *   Именно это значение нужно всему, что переводит элемент в другую систему координат
+ *   (`elementToGroupLocal` пишет его обратно в `el.x`).
+ *
+ * Совпадают они далеко не всегда: у повёрнутого бокса габарит шире фигуры, а у ГРУППЫ
+ * габарит — объединение детей, тогда как origin — её собственный `x/y`. Сейчас рамка
+ * облегает содержимое без отступа (`GROUP_PADDING = 0`), но схемы, сохранённые с прежним
+ * отступом 20, не мигрируются, и у их групп origin лежит левее и выше габарита. Подмена
+ * origin габаритом у групп и приводила к тому, что вложенная группа при перегруппировке
+ * уезжала вправо-вниз ровно на этот отступ, накапливая сдвиг с каждым уровнем вложенности.
+ */
 export interface ElementBounds {
   minX: number;
   minY: number;
@@ -22,9 +38,13 @@ export interface ElementBounds {
  * У дуги `rotate` — это начало дуги, а не поворот фигуры: её габарит — описанный
  * квадрат `2r × 2r`, от угла он не зависит. Крутить его как бокс значило бы раздувать
  * рамку выделения (и рамку группы-предка) на ровном месте при каждом повороте дуги.
+ *
+ * У текста `rotation` не прокидывается в Konva вовсе (см. TextShapeElement), поэтому
+ * `rotate`, приехавший импортом или вставкой, раздувал бы AABB вокруг фигуры, которая
+ * на холсте стоит ровно.
  */
 const rotationOf = (rendered: LeafElement): number =>
-  rendered.type === "arc" ? 0 : (rendered.rotate || 0);
+  rendered.type === "arc" || rendered.type === "text" ? 0 : (rendered.rotate || 0);
 
 /** Габаритный прямоугольник повёрнутого бокса w×h с левым верхним углом в (x, y). */
 const rotatedBoxBounds = (x: number, y: number, w: number, h: number, rotate: number): ElementBounds => {
@@ -49,10 +69,29 @@ const rotatedBoxBounds = (x: number, y: number, w: number, h: number, rotate: nu
   return {minX, minY, maxX, maxY, absX: x, absY: y};
 };
 
-/** Границы группы = объединение границ её прямых детей (рекурсивно). */
+/**
+ * Габарит текста — по измеренным глифам, а не по `w/h` из модели.
+ *
+ * У текста `w/h` описывают что угодно, только не нарисованное: `80×80` от рождения,
+ * `h` не пишется никогда, `w` действует лишь в режиме фиксированной ширины. Считая по
+ * ним, рамка группы обжимала пустоту, направляющие липли не к тем краям, а поворот
+ * (`transformSelection`) отражал текст относительно фантомного квадрата.
+ */
+const textBounds = (rendered: LeafElement, abs: {x: number; y: number}): ElementBounds => {
+  const {w, h} = measureText(rendered);
+  return {minX: abs.x, minY: abs.y, maxX: abs.x + w, maxY: abs.y + h, absX: abs.x, absY: abs.y};
+};
+
+/**
+ * Границы группы = объединение границ её прямых детей (рекурсивно).
+ *
+ * `absX/absY` — это origin САМОЙ группы (`abs`), а не минимум детей: у группы со старым
+ * отступом (или со скрытыми членами) они расходятся. См. контракт у `ElementBounds`.
+ */
 const groupChildrenBounds = (
   el: DiagramElement,
   index: ElementIndex,
+  abs: {x: number; y: number},
   boundsOf: (child: DiagramElement) => ElementBounds,
 ): ElementBounds | null => {
   const children = getChildElements(el.key, index);
@@ -67,7 +106,7 @@ const groupChildrenBounds = (
     if (b.maxY > maxY) maxY = b.maxY;
   }
 
-  return {minX, minY, maxX, maxY, absX: minX, absY: minY};
+  return {minX, minY, maxX, maxY, absX: abs.x, absY: abs.y};
 };
 
 /** Разбирает `points` полигона: массив чисел либо JSON-строка. */
@@ -97,7 +136,7 @@ export function elementBounds(el: DiagramElement, index: ElementIndex): ElementB
   const abs = absolutePosition(el, index, false);
 
   if (el.type === "group") {
-    const groupBounds = groupChildrenBounds(el, index, child => elementBounds(child, index));
+    const groupBounds = groupChildrenBounds(el, index, abs, child => elementBounds(child, index));
     if (groupBounds) return groupBounds;
   }
 
@@ -122,6 +161,9 @@ export function elementBounds(el: DiagramElement, index: ElementIndex): ElementB
   }
 
   const rendered = getRenderedElement(el) as LeafElement;
+
+  if (rendered.type === "text") return textBounds(rendered, abs);
+
   const w = rendered.w || 0;
   const h = rendered.h || 0;
   const rotate = rotationOf(rendered);
@@ -144,7 +186,7 @@ export function elementBoundsRendered(el: DiagramElement, index: ElementIndex): 
   const rendered = getRenderedElement(el) as LeafElement;
 
   if (el.type === "group") {
-    const groupBounds = groupChildrenBounds(el, index, child => elementBoundsRendered(child, index));
+    const groupBounds = groupChildrenBounds(el, index, abs, child => elementBoundsRendered(child, index));
     if (groupBounds) return groupBounds;
   }
 
@@ -170,7 +212,9 @@ export function elementBoundsRendered(el: DiagramElement, index: ElementIndex): 
     };
   }
 
-  if (el.type === "polygon" || rendered.type === "polygon") {
+  // Кривая — те же локальные точки, что у полигона (у неё это концы и направляющие).
+  const isPointsShape = (t: string) => t === "polygon" || t === "curve";
+  if (isPointsShape(el.type) || isPointsShape(rendered.type)) {
     const pts = parsePoints(rendered.points);
 
     if (pts.length >= 2) {
@@ -186,6 +230,8 @@ export function elementBoundsRendered(el: DiagramElement, index: ElementIndex): 
       return {minX, minY, maxX, maxY, absX: abs.x, absY: abs.y};
     }
   }
+
+  if (el.type === "text" || rendered.type === "text") return textBounds(rendered, abs);
 
   const w = rendered.w || 0;
   const h = rendered.h || 0;

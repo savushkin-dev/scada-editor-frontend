@@ -1,7 +1,7 @@
 import React, {useMemo, useRef, useState} from "react";
 import CodeMirror, {EditorView} from "@uiw/react-codemirror";
 import {javascript} from "@codemirror/lang-javascript";
-import {Boxes, Play, Tag, Terminal, Wand2, X} from "lucide-react";
+import {Boxes, ExternalLink, Play, Tag, Terminal, Wand2, X} from "lucide-react";
 import {useModalStore} from "@/store/modalStore";
 import {useEditorStore} from "@/store/useEditorStore";
 import {cn} from "@/lib/utils";
@@ -14,8 +14,10 @@ import {
   ElementEvents,
   PropertyRef,
 } from "@/types/binding.types";
-import {collectTagScope, uniqueVarName, withPropertyRefs} from "@/lib/runtime/bindingScope";
+import {collectTagScope, modernizeScopeCode, uniqueVarName, withPropertyRefs} from "@/lib/runtime/bindingScope";
 import {compileEventScript, executeEventScript} from "@/lib/runtime/eventScript";
+import {checkScriptSyntax} from "@/lib/runtime/scriptSyntax";
+import {describeSceneTarget, resolveSceneTarget} from "@/lib/runtime/sceneTarget";
 import {getRenderedElement} from "@/lib/getRenderedElement";
 import {ChooseObjectPropertyModal, type PickedProperty} from "../bindings/OpenChooseObjectPropertyModal";
 
@@ -40,9 +42,25 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
 
   const [propertyRefs, setPropertyRefs] = useState<PropertyRef[]>(existing?.propertyRefs ?? []);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [code, setCode] = useState(existing?.code ?? "");
+  // Старый синтаксис «Имя.V» показываем уже переведённым — см. OpenBindingEditorModal.
+  // Скоуп для перевода собираем прямо здесь: `scope` ниже зависит от состояния, а
+  // инициализатор useState выполняется раньше него ровно один раз.
+  const [code, setCode] = useState(() =>
+    modernizeScopeCode(
+      existing?.code ?? "",
+      withPropertyRefs(collectTagScope(element.properties), existing?.propertyRefs).names,
+    ),
+  );
   const [mockValues, setMockValues] = useState<Record<string, string>>({});
   const [testResult, setTestResult] = useState<TestResult>(null);
+  // Схемы текущего проекта — для чипов openScene и для тест-прогона. Текущую не
+  // предлагаем: переход на саму себя монитор просто пропустит.
+  const sceneList = useEditorStore(s => s.sceneList);
+  const currentSceneId = useEditorStore(s => s.scene?.id ?? null);
+  const otherScenes = useMemo(
+    () => sceneList.filter(s => s.id !== currentSceneId),
+    [sceneList, currentSceneId],
+  );
 
   const scope = useMemo(
     () => withPropertyRefs(collectTagScope(element.properties), propertyRefs),
@@ -66,7 +84,7 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
     setPickerOpen(false);
     const found = propertyRefs.find(r => r.propertyId === picked.propertyId);
     if (found) {
-      insertAtCursor(`setProperty("${found.varName}", ${found.varName}.V + 1)`);
+      insertAtCursor(`setProperty("${found.varName}", ${found.varName} + 1)`);
       return;
     }
     const taken = new Set<string>([...scope.names, ...propertyRefs.map(r => r.varName)]);
@@ -83,7 +101,7 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
         valueType: picked.valueType,
       },
     ]);
-    insertAtCursor(`setProperty("${varName}", ${varName}.V + 1)`);
+    insertAtCursor(`setProperty("${varName}", ${varName} + 1)`);
   };
 
   const removePropertyRef = (propertyId: number) =>
@@ -104,7 +122,13 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
       if (varName in scope.tagIdByName) valuesByTagId.set(scope.tagIdByName[varName], raw);
       else valuesByPropertyId.set(scope.propertyIdByName[varName], raw);
     }
-    const res = executeEventScript(compiled, valuesByTagId, valuesByPropertyId, getRenderedElement(element));
+    // runScript в тест-прогоне ничего не отправляет — только показывает, что ушло бы.
+    const scriptCalls: string[] = [];
+    const recordRunScript = (name: string, args?: Record<string, unknown>) =>
+      scriptCalls.push(`runScript(${JSON.stringify(name)}${args ? `, ${JSON.stringify(args)}` : ""})`);
+    const res = executeEventScript(
+      compiled, valuesByTagId, valuesByPropertyId, getRenderedElement(element), recordRunScript,
+    );
     if ("error" in res) {
       setTestResult({kind: "error", message: `Ошибка исполнения: ${res.error}`});
       return;
@@ -114,12 +138,35 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
       ...res.intents.map(i =>
         i.kind === "state" ? `setState("${i.stateName}")` : `setProp("${i.key}", ${JSON.stringify(i.value)})`,
       ),
+      ...scriptCalls,
     ];
+    if (res.menu) {
+      parts.push(`showMenu → пунктов: ${res.menu.length}`);
+      for (const item of res.menu) {
+        const known = element.scripts?.some(sc => sc.name === item.script);
+        parts.push(`  «${item.label}» → ${item.script}${item.args ? ` ${JSON.stringify(item.args)}` : ""}${known ? "" : " (нет такого скрипта)"}`);
+      }
+    }
+    if (res.openScene !== undefined) {
+      // Тот же разбор, что в мониторе, — иначе тест обещал бы переход, которого не будет.
+      const target = resolveSceneTarget(res.openScene, sceneList);
+      parts.push(
+        target.kind === "found"
+          ? `openScene → «${target.scene.name}» (#${target.scene.id})`
+          : target.kind === "ambiguous"
+            ? `openScene → несколько схем ${describeSceneTarget(res.openScene)}, перехода не будет`
+            : `openScene → не найдена: ${describeSceneTarget(res.openScene)}`,
+      );
+    }
     setTestResult({kind: "ok", text: parts.length ? parts.join("\n") : "Код выполнен, действий нет"});
   };
 
+  // Бэкенд отклонит всю сцену со скриптом, который не разбирается (контракт 25.09.2026):
+  // показываем ошибку сразу и не даём сохранить — см. checkScriptSyntax.
+  const syntaxError = useMemo(() => checkScriptSyntax(code), [code]);
+
   const handleSave = () => {
-    if (!code.trim()) return;
+    if (!code.trim() || syntaxError) return;
     const nextHandler: ElementEventHandler = {code, propertyRefs};
     const nextEvents: ElementEvents = [
       ...(element.events ?? []).filter(e => e.event_type !== event),
@@ -146,11 +193,17 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
         title={<>Событие {EVENT_LABEL[event]}</>}
         description={
           <>
-            JavaScript исполняется в мониторе по событию. Чтение: <code>Имя.V</code> (тег/свойство).
+            JavaScript исполняется в мониторе по событию. Чтение: <code>Имя</code> — переменная это
+            само значение тега/свойства (исходная строка — <code>RAW.Имя</code>).
             Запись свойства объекта: <code>setProperty(&quot;Имя&quot;, значение)</code> — на неё
             реагируют привязки других элементов. Серверный скрипт (запись тега в ПЛК):{" "}
-            <code>runScript(&quot;Имя&quot;)</code>. Также доступны <code>setProp</code>,{" "}
-            <code>setState</code>, <code>self</code>.
+            <code>runScript(&quot;Имя&quot;)</code>, с аргументами —{" "}
+            <code>runScript(&quot;Имя&quot;, {"{"} recipe: 4 {"}"})</code> (в серверном скрипте это объект{" "}
+            <code>args</code>). Меню выбора у точки клика:{" "}
+            <code>showMenu([{"{"} label, script, args {"}"}])</code> — выбранный пункт запустит{" "}
+            <code>script</code> с его <code>args</code>. Открыть другую схему проекта:{" "}
+            <code>openScene(&quot;Имя схемы&quot;)</code> или <code>openScene(id)</code>.
+            Также доступны <code>setProp</code>, <code>setState</code>, <code>self</code>.
           </>
         }
       />
@@ -167,7 +220,7 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
                   key={tagName}
                   className={chipClasses}
                   title={scope.tagIdByName[tagName]}
-                  onClick={() => insertAtCursor(`${tagName}.V`)}
+                  onClick={() => insertAtCursor(tagName)}
                 >
                   <Tag size={12} />
                   {tagName}
@@ -183,7 +236,7 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
               key={ref.propertyId}
               className={cn(chipClasses, "bg-emerald-950/60 text-emerald-300 border-emerald-800/40 hover:bg-emerald-900/70")}
               title={`${ref.componentLabel} · ${ref.propertyName} — клик вставит setProperty`}
-              onClick={() => insertAtCursor(`setProperty("${ref.varName}", ${ref.varName}.V + 1)`)}
+              onClick={() => insertAtCursor(`setProperty("${ref.varName}", ${ref.varName} + 1)`)}
             >
               <Boxes size={12} />
               {ref.varName}
@@ -220,6 +273,26 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
               >
                 <Terminal size={12} />
                 {script.name}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Схемы проекта — клик вставит openScene(id). Id, а не имя: он переживает
+            переименование схемы. Имя — блочным комментарием, чтобы код остался читаемым и
+            вставка посреди строки не закомментировала её хвост. */}
+        {otherScenes.length > 0 && (
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-gray-500 uppercase tracking-wider">Схемы:</span>
+            {otherScenes.map(scene => (
+              <span
+                key={scene.id}
+                className={cn(chipClasses, "bg-sky-950/60 text-sky-300 border-sky-800/40 hover:bg-sky-900/70")}
+                title={`Схема «${scene.name}» — клик вставит openScene`}
+                onClick={() => insertAtCursor(`openScene(${scene.id} /* ${scene.name.replace(/\*\//g, "* /")} */)`)}
+              >
+                <ExternalLink size={12} />
+                {scene.name}
               </span>
             ))}
           </div>
@@ -301,6 +374,12 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
         </Collapsible>
       )}
 
+      {syntaxError && (
+        <div role="alert" className="shrink-0 text-sm text-red-600 dark:text-red-400">
+          Синтаксическая ошибка: {syntaxError}
+        </div>
+      )}
+
       <div className="shrink-0 flex gap-3 justify-end">
         <button
           onClick={closeModal}
@@ -310,7 +389,7 @@ function EventScriptModalContent({element, event}: EventScriptProps) {
         </button>
         <button
           onClick={handleSave}
-          disabled={!code.trim()}
+          disabled={!code.trim() || Boolean(syntaxError)}
           className="px-6 py-2.5 rounded-lg font-medium bg-linear-to-r from-indigo-600 to-blue-600 hover:from-indigo-500 hover:to-blue-500 disabled:from-gray-300 disabled:to-gray-300 dark:disabled:from-gray-700 dark:disabled:to-gray-700 disabled:text-gray-500 text-white shadow-lg shadow-indigo-900/30 transition-all disabled:shadow-none"
         >
           Сохранить

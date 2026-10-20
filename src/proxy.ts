@@ -1,15 +1,15 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 
-const protectedRoutes = ['/channels', '/editor', '/monitor', '/log'];
-const authRoutes = ['/login', '/register'];
+const protectedRoutes = ['/channels', '/editor', '/monitor', '/automation', '/data', '/log', '/actions', '/admin'];
+const authRoutes = ['/login'];
 
 export function proxy(request: NextRequest) {
   const token = request.cookies.get('access_token')?.value; // или как ты хранишь токен
 
   const { pathname } = request.nextUrl;
 
-  // Если пользователь авторизован и пытается зайти на login/register
+  // Если пользователь авторизован и пытается зайти на login
   if (token && authRoutes.includes(pathname)) {
     return NextResponse.redirect(new URL('/channels', request.url));
   }
@@ -41,10 +41,13 @@ export const config = {
   matcher: [
     '/',
     '/login',
-    '/register',
     '/editor/:path*',
     '/channels/:path*',
     '/monitor/:path*',
+    '/automation/:path*',
+    '/data/:path*',
     '/log/:path*',
+    '/actions/:path*',
+    '/admin/:path*',
   ],
 };

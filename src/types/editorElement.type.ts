@@ -58,6 +58,21 @@ export interface ElementScript {
   serverId?: number | string;
   name: string;
   content: string;
+  /**
+   * Показывать ли скрипт пунктом в меню монитора (ПКМ по компоненту). Ставится
+   * галочкой «Добавить действие в монитор?» в модалке скрипта и едет на сервер
+   * одноимённым полем DTO — внутри скрипта места под флаг нет (`script` — это
+   * Java-исходник), а `transformElements` пересобирает скрипты по белому списку,
+   * так что «прокатить» признак мимо контракта не получится.
+   */
+  displayed?: boolean;
+  /**
+   * Минимальный уровень оператора, которому монитор разрешает этот скрипт (1…10);
+   * `null`/нет — уровень 1. Едет полем `access_level` DTO. Проверяет сервер (по prod-выпуску),
+   * монитор лишь гасит кнопку заранее. Копии (палитра, вставка) обязаны его сохранить —
+   * иначе уровень молча станет 1, а бэкенд этого не заметит.
+   */
+  accessLevel?: number | null;
 }
 
 /**
@@ -100,8 +115,12 @@ export type ComponentCreateDto = {
   type: string;
   parent_key: string | null;
   parent_id: number | null;
-  /** `id` — только у скриптов, пришедших с сервера (см. ElementScript.serverId). */
-  scripts: { id?: number | string; name: string; script: string }[];
+  /**
+   * `id` — только у скриптов, пришедших с сервера (см. ElementScript.serverId).
+   * `displayed` шлём всегда: бэкенд считает список скриптов полным, и снятая
+   * галочка обязана дойти так же, как поставленная.
+   */
+  scripts: { id?: number | string; name: string; script: string; displayed?: boolean; access_level?: number | null }[];
   bindings: BindingDto[];
   /** `id` — только у событий, пришедших с сервера. */
   events: { id?: number | string; event_type: string; script: string }[];
@@ -112,9 +131,14 @@ export type ComponentCreateDto = {
     image: string;
     isDefault: boolean;
   }[];
-  /** Только для type==="table": привязки строк к тегам/локальным параметрам,
-   *  номер строки — в поле position (см. src/lib/editor/rowBinding.ts). */
-  properties?: ComponentPropertyDto[];
+  /**
+   * Свойства компонента целиком — у ЛЮБОГО типа элемента: отдельного REST-пути у них
+   * больше нет. Список задаёт весь набор: чего в нём нет, то бэкенд удаляет
+   * (сопоставление сначала по `id`, затем по `name`). Отсутствие поля — «не трогать».
+   *
+   * У строк таблицы номер строки лежит в `position` (см. src/lib/editor/rowBinding.ts).
+   */
+  properties?: PropertyCreateDto[];
 };
 // Базовый интерфейс для всех элементов на холсте (листья + группы)
 export interface BaseCanvasElement {
@@ -143,12 +167,31 @@ export interface BaseCanvasElement {
   label?: string;
   visible?: boolean;
   bg?: string;
+  /**
+   * Порядок отрисовки среди соседей (элементов с тем же parentKey), как CSS z-index.
+   * Больше — выше. Отсутствует == 0; сортировка стабильная, поэтому при равных
+   * значениях порядок остаётся прежним — порядком массива. См. lib/editor/zOrder.ts.
+   */
+  zIndex?: number;
+  /**
+   * Контекстное меню компонента в мониторе (ПКМ): ширина, шрифт, высота пункта. Нет поля
+   * или ключа — значение по умолчанию. От состояния не зависит (BASE_ONLY_KEYS), на сервер
+   * едет внутри image, как zIndex. См. lib/editor/monitorMenu.ts.
+   */
+  monitorMenu?: MonitorMenuSettings;
+  /**
+   * Оформление тренда (только у `type === "trend"`): окно, шаг сетки и вид перьев. Перья
+   * сами — тег-свойства элемента, связь по `name`. Базовый ключ, как monitorMenu: от
+   * состояния не зависит, едет внутри image. См. lib/editor/trendSettings.ts.
+   */
+  trend?: TrendSettings;
 }
 
 export type ElementType =
   | "polygon"
   | "circle"
   | "arc"
+  | "curve"
   | "line"
   | "text"
   | "group"
@@ -172,7 +215,9 @@ export type ElementType =
 export interface LeafElement extends BaseCanvasElement {
   type: ElementType;
   color?: string;
-  points?: number[]; // Array of [x1,y1, x2,y2, ...] relative to element x,y or absolute? Let's use absolute or relative depending on implementation
+  /** Полигон: вершины; кривая (`curve`): начало, две направляющие, конец.
+   *  В обоих случаях ЛОКАЛЬНО относительно `x, y` элемента. */
+  points?: number[];
   sides?: number; // for polygon initial generation
   radius?: number; // for circle and regular polygon initial generation
 
@@ -245,6 +290,15 @@ export interface LeafElement extends BaseCanvasElement {
   headerColor?: string;
   /** Статические данные ячеек по ключу "${row}_${col}". */
   cells?: Record<string, TableCellData>;
+  /**
+   * Ширины столбцов и высоты строк — ВЕСА, а не координаты: на чтении нормируются
+   * к текущим w и (h − headerH), см. src/lib/editor/tableLayout.ts. Отсутствие поля
+   * означает равномерную сетку, поэтому старые таблицы выглядят как раньше.
+   */
+  colWidths?: number[];
+  rowHeights?: number[];
+  /** Явная высота шапки; без неё выводится из fontSize, как раньше. */
+  headerH?: number;
   // ... добавляй по мере необходимости
 }
 
@@ -307,4 +361,44 @@ export type PropertySchema =
   type: "select";
   options: {label: string; value: string}[];
   defaultValue?: string;
+}
+
+/** Оформление одного пера тренда. Нет поля — значение по умолчанию. */
+export interface TrendPenStyle {
+  color?: string;
+  width?: number;
+  /**
+   * Коэффициент пера: на график, ось, подсказку и легенду идёт `value × k` — так разные
+   * единицы приводятся к общей шкале (масса ×0,001 → т). Нет — 1. Своей шкалы у пера больше нет
+   * (контракт 2026-09-29-trend-common-scale-contract.md).
+   */
+  k?: number;
+  /**
+   * Сдвиг пера: на график идёт `value × k + b` — как `SetStairs(тег, поле, k, b, 0)` старой SCADA.
+   * Разводит дискретные сигналы по высоте, чтобы ступеньки 0/5 не лежали друг на друге, и
+   * поднимает перо с отрицательным `k` над осью. Нет — 0.
+   */
+  b?: number;
+}
+
+/** Настройка тренда (контракты 2026-09-28-tag-archive, раздел 1, и 2026-09-29-trend-common-scale). */
+export interface TrendSettings {
+  /** Живое окно, секунды. */
+  window?: number;
+  /** Шаг сетки и подписей времени по X, секунды. На данные не влияет. */
+  step?: number;
+  /** Общая шкала Y всего тренда. Не задано — авто по данным всех перьев после `k`. */
+  min?: number;
+  max?: number;
+  /** Ключ — `name` свойства-пера. */
+  pens?: Record<string, TrendPenStyle>;
+}
+
+/** Контекстное меню компонента в мониторе, px. Пределы — lib/editor/monitorMenu.ts. */
+export interface MonitorMenuSettings {
+  /** Ширина плашки; без неё меню по самой длинной подписи. */
+  width?: number;
+  fontSize?: number;
+  /** Минимальная высота пункта (подпись может перенестись на вторую строку). */
+  itemHeight?: number;
 }

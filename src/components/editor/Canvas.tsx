@@ -1,17 +1,21 @@
 "use client";
 
-import React, { useMemo, useRef, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import Konva from "konva";
 import { Stage, Layer, Rect, Line, Circle } from "react-konva";
 
 import { useShallow } from "zustand/react/shallow";
 
 import { useEditorStore } from "@/store/useEditorStore";
-import { snap } from "@/lib/utils";
+import { snap, GRID } from "@/lib/utils";
 import { resolveClickTarget as resolveClickTargetFn } from "@/lib/editor/resolveClickTarget";
-import { createGridPattern } from "@/lib/editor/gridPattern";
+import {
+  createGridPattern, GRID_MAJOR, FINE_GRID_MIN_ZOOM, MAJOR_GRID_MIN_ZOOM,
+} from "@/lib/editor/gridPattern";
+import { resolveSheet } from "@/lib/editor/sheet";
 import { getChildElements, getElementIndex } from "@/lib/editor/elementIndex";
 import { selectVisibleRootKeys } from "@/lib/editor/viewportCulling";
+import { sortByZIndex } from "@/lib/editor/zOrder";
 import { NON_TRANSFORMABLE } from "./canvas/useElementRenderState";
 // Импорт ради побочного эффекта: глобальные настройки Konva (порог начала drag'а)
 // должны примениться до создания Stage.
@@ -36,10 +40,20 @@ import { useZoomControls } from "./canvas/hooks/useZoomControls";
 import { useHoverHighlight } from "./canvas/hooks/useHoverHighlight";
 import { usePendingPlacement } from "./canvas/hooks/usePendingPlacement";
 import { MonitorInteractionLayer } from "./canvas/MonitorInteractionLayer";
+import { buildChoiceMenu, buildMonitorMenu, hasMonitorMenu, isOpenableTrend } from "./canvas/buildMonitorMenu";
+import { monitorViewFromCamera, resolveMonitorView } from "@/lib/editor/monitorView";
+import { isMonitorContainer, pickMonitorContainer, pickMonitorTarget } from "@/lib/editor/pickMonitorTarget";
+import { isRuntimeLive, setRuntimeMenuHandler, type ScreenPoint } from "@/lib/runtime/runtimeEventBus";
+import RuntimeNoticeLayer from "@/components/monitor/RuntimeNoticeLayer";
 import type { CanvasMenuItem, EditorRenderContext } from "./canvas/types";
+import type { DiagramElement, MonitorMenuSettings } from "@/types/editorElement.type";
+import { readMonitorMenu } from "@/lib/editor/monitorMenu";
 
-const CANVAS_WIDTH = 5000;
-const CANVAS_HEIGHT = 5000;
+/**
+ * Насколько «стол» выходит за края листа. Константа, а не доля от листа: лист
+ * может быть маленьким, и `sheet.w * 3` оставил бы вокруг него голый Stage.
+ */
+const DESK_PAD = 20000;
 
 interface CanvasProps {
   /**
@@ -48,9 +62,17 @@ interface CanvasProps {
    * маркиз/хоткеи/контекст-меню отключены; пан/зум камеры остаются.
    */
   readOnly?: boolean;
+  /**
+   * Монитор в режиме «Архив»: действия выключены — слой кликов по скриптам не монтируется,
+   * а меню элемента сводится к «Открыть тренд». Записей в ПЛК из архива быть не может.
+   */
+  archive?: boolean;
 }
 
-export default function Canvas({ readOnly = false }: CanvasProps) {
+export default function Canvas({ readOnly = false, archive = false }: CanvasProps) {
+  // Обработчики монитора не пересоздаются на смену режима — читают его через ref.
+  const archiveRef = useRef(archive);
+  useEffect(() => { archiveRef.current = archive; }, [archive]);
   // Точечный срез вместо подписки на весь стор: без него холст перерисовывался на
   // ЛЮБОЕ изменение (sceneList, projectList, clipboard, currentProject …), а не
   // только на то, что он рисует. Ср. тот же приём в WorkSpace.
@@ -63,6 +85,7 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
     moveSelectedBy, duplicateSelected, selectAllInScope, setCamera,
     pendingPlacement, setEditingTextKey, editingTextKey,
     groupSelected, ungroupSelected,
+    setMonitorView,
   } = useEditorStore(useShallow(s => ({
     elements: s.elements, selectedIds: s.selectedIds, selectMultiple: s.selectMultiple,
     setCanvasRect: s.setCanvasRect,
@@ -79,11 +102,12 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
     pendingPlacement: s.pendingPlacement,
     setEditingTextKey: s.setEditingTextKey, editingTextKey: s.editingTextKey,
     groupSelected: s.groupSelected, ungroupSelected: s.ungroupSelected,
+    setMonitorView: s.setMonitorView,
   })));
 
   const { resolvedTheme, themeColors } = useThemeColors();
 
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: CanvasMenuItem[] } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: CanvasMenuItem[]; settings?: MonitorMenuSettings } | null>(null);
   const [moveToGroupState, setMoveToGroupState] = useState<{ isOpen: boolean; elementKey: string | null }>({ isOpen: false, elementKey: null });
   const [addComponentState, setAddComponentState] = useState<{ isOpen: boolean; targetKey: string | null }>({ isOpen: false, targetKey: null });
 
@@ -102,14 +126,55 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
   // параллельно бегала по массиву линейным поиском.
   const elementIndex = useMemo(() => getElementIndex(elements), [elements]);
   const elementsMap = elementIndex.byKey;
+  // Порядок отрисовки корней — по zIndex; сортировка стабильная, поэтому при
+  // равных слоях (в т.ч. у схем, где слои никто не трогал) остаётся порядок
+  // массива. Сортируем ДО отсечения по видимой области: selectVisibleRootKeys
+  // только фильтрует и порядок сохраняет.
   const rootElements = useMemo(
-    () => getChildElements(String(scene?.id ?? ""), elementIndex),
+    () => sortByZIndex(getChildElements(String(scene?.id ?? ""), elementIndex)),
     [elementIndex, scene],
   );
 
-  const gridPattern = useMemo(() => createGridPattern(themeColors.gridLine), [themeColors.gridLine]);
+  /** Лист сцены. Считается из elements (кэш по ссылке на массив), в сторе не хранится. */
+  const sheet = useMemo(() => resolveSheet(elements), [elements]);
+  // Вид, зафиксированный для монитора (замок в панели зума). В редакторе — рамка и
+  // нажатая кнопка, в мониторе — камера и запрет зума/пана (см. lib/editor/monitorView.ts).
+  const monitorView = useMemo(() => resolveMonitorView(elements), [elements]);
+
+  // Шаг сетки по зуму: паттерн живёт в мировых координатах и ужимается вместе со
+  // сценой, поэтому на «весь лист» (A0 — это 0.056) мелкая клетка занимает около
+  // пикселя и сетка превращается в сплошную заливку. null — сетки нет вовсе.
+  const gridStep = useMemo(() => {
+    if (camera.zoom >= FINE_GRID_MIN_ZOOM) return GRID;
+    if (camera.zoom >= MAJOR_GRID_MIN_ZOOM) return GRID_MAJOR;
+    return null;
+  }, [camera.zoom]);
+
+  const gridPattern = useMemo(
+    () => gridStep === null
+      ? null
+      : createGridPattern(
+        gridStep === GRID ? themeColors.gridLine : themeColors.gridLineMajor,
+        gridStep,
+      ),
+    [gridStep, themeColors.gridLine, themeColors.gridLineMajor],
+  );
 
   const closeMenu = useCallback(() => setContextMenu(null), []);
+
+  // Монитор: Escape поднимает на уровень вверх. Общий useEditorHotkeys здесь включать
+  // нельзя — он тянет удаление, копирование и группировку, которых в мониторе быть не
+  // должно. Меню закрывает Escape раньше нас (свой слушатель в capture-фазе).
+  useEffect(() => {
+    if (!readOnly) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const s = useEditorStore.getState();
+      if (s.activeGroupKey) s.exitGroup();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [readOnly]);
 
   // Колбэки холста намеренно БЕЗ зависимостей от изменчивого состояния: они
   // попадают в ctx, а ctx обязан быть стабильным по ссылке (иначе не работает
@@ -195,11 +260,196 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
     [rootElements, elementIndex, camera, canvasRect, selectedIds, activeGroupKey],
   );
 
-  const { zoomBy, zoomFit } = useZoomControls({ canvasRect, setCamera });
+  const { zoomStep, zoomFit, zoomFitSheet } = useZoomControls({ canvasRect, setCamera });
+
+  /**
+   * Что под курсором в мониторе. Свой хит-тест, а не Konva: в readOnly основной слой
+   * идёт с listening=false, фигуры вне хит-графа и e.target всегда сам Stage.
+   * getRelativePointerPosition учитывает трансформ камеры — это уже мировые координаты.
+   */
+  const pickMonitorAtPointer = useCallback((): DiagramElement | null => {
+    const pos = stageRef.current?.getRelativePointerPosition();
+    if (!pos) return null;
+    const s = useEditorStore.getState();
+    return pickMonitorTarget(pos, {
+      elementIndex: getElementIndex(s.elements),
+      activeGroupKey: s.activeGroupKey,
+      sceneId: String(s.scene?.id ?? ""),
+    });
+  }, []);
+
+  /**
+   * Монитор: меню компонента — от того элемента, ПО КОТОРОМУ щёлкнули.
+   *
+   * Хит-тест отдаёт самый глубокий элемент под курсором, а теги и действия в схемах обычно
+   * висят на компоненте, тогда как его внутренние примитивы пусты. Поэтому от найденного
+   * поднимаемся по `parentKey` до ближайшего предка, у которого пункты есть: «точечно»
+   * сохраняется (сначала пробуем именно кликнутый), но клик не проваливается в пустоту.
+   *
+   * Ничего не нашли по всей цепочке — null, меню не открываем вовсе.
+   */
+  const resolveMonitorMenu = (point?: ScreenPoint): { items: CanvasMenuItem[]; settings?: MonitorMenuSettings } | null => {
+    const picked = pickMonitorAtPointer();
+    if (!picked) return null;
+
+    const byKey = useEditorStore.getState().elements;
+    const map = new Map(byKey.map(el => [el.key, el] as const));
+
+    let el: DiagramElement | undefined = picked;
+    const hasMenu = archiveRef.current ? isOpenableTrend : hasMonitorMenu;
+    while (el && !hasMenu(el)) {
+      el = el.parentKey ? map.get(el.parentKey) : undefined;
+    }
+    if (!el) return null;
+
+    const items = buildMonitorMenu(el, { closeMenu, isLive: isRuntimeLive(), archive: archiveRef.current, point });
+    if (!items.length) return null;
+
+    // Вид меню задаётся тому компоненту, чьё это меню (см. подъём по parentKey выше).
+    return { items, settings: readMonitorMenu(el.monitorMenu) };
+  };
+
+  /**
+   * Меню по ЛКМ/касанию, отложенное на окно двойного клика (см. handleMonitorClick).
+   * Метка последнего касания — чтобы эмулированный браузером `click` после `tap` не
+   * считался вторым кликом.
+   */
+  const pendingMonitorMenuRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTapAtRef = useRef(0);
+  const cancelPendingMonitorMenu = useCallback(() => {
+    if (pendingMonitorMenuRef.current) clearTimeout(pendingMonitorMenuRef.current);
+    pendingMonitorMenuRef.current = null;
+  }, []);
+  useEffect(() => cancelPendingMonitorMenu, [cancelPendingMonitorMenu]);
+
+  const handleMonitorContextMenu = (e: Konva.KonvaEventObject<PointerEvent>) => {
+    cancelPendingMonitorMenu();
+    const menu = resolveMonitorMenu({ x: e.evt.clientX, y: e.evt.clientY });
+    if (menu) setContextMenu({ x: e.evt.clientX, y: e.evt.clientY, ...menu });
+  };
+
+  /**
+   * Контейнер под курсором, в который двойной клик мог бы войти. Нужен КОНТЕЙНЕР, а не
+   * самый глубокий элемент: тот, как правило, лист, и заходить внутрь стало бы нечем.
+   */
+  const containerAtPointer = (): DiagramElement | null => {
+    const pos = stageRef.current?.getRelativePointerPosition();
+    if (!pos) return null;
+    const s = useEditorStore.getState();
+    const el = pickMonitorContainer(pos, {
+      elementIndex: getElementIndex(s.elements),
+      activeGroupKey: s.activeGroupKey,
+      sceneId: String(s.scene?.id ?? ""),
+    });
+    return el && isMonitorContainer(el) ? el : null;
+  };
+
+  /**
+   * Монитор: ЛКМ или касание по компоненту без скрипта `onClick` открывает то же меню,
+   * что и ПКМ. На сенсорной панели правой кнопки нет, и без этого «Опции» и действия там
+   * были недоступны. Клик, который отработал скриптом `onClick`, сюда не доходит: его
+   * область в MonitorInteractionLayer гасит всплытие.
+   *
+   * Меню откладывается на окно двойного клика, если двойной клик здесь что-то значит
+   * (вход в группу, скрипт `onDoubleClick`): меню открывается под курсором, и второй
+   * клик попал бы в его пункт, а не на холст, — Konva не увидела бы двойного клика, а
+   * оператор нажал бы «Опции» или действие. Второй клик в окне снимает отложенное меню.
+   *
+   * Касание откладывается всегда: на пустом месте Konva не гасит касание, и браузер
+   * следом шлёт эмулированные mousedown/click — mousedown закрыл бы только что открытое
+   * меню (useStageInteractions), а click сошёл бы за второй клик.
+   */
+  const handleMonitorClick = (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
+    const isTouch = e.type === "tap";
+    if (isTouch) {
+      lastTapAtRef.current = performance.now();
+    } else {
+      if ((e.evt as MouseEvent).button !== 0) return;
+      if (performance.now() - lastTapAtRef.current < Konva.dblClickWindow) return;
+    }
+
+    // Второй клик в окне — это двойной клик, его разберёт handleMonitorDblClick.
+    if (pendingMonitorMenuRef.current) {
+      cancelPendingMonitorMenu();
+      return;
+    }
+
+    const point = "changedTouches" in e.evt
+      ? e.evt.changedTouches[0]
+      : e.evt;
+    if (!point) return;
+    const menu = resolveMonitorMenu({ x: point.clientX, y: point.clientY });
+    if (!menu) return;
+    const open = () => setContextMenu({ x: point.clientX, y: point.clientY, ...menu });
+
+    const dblClickMatters = isTouch
+      || e.target !== e.target.getStage()   // область скрипта onDoubleClick
+      || containerAtPointer() !== null;
+    if (!dblClickMatters) { open(); return; }
+
+    const sceneAt = useEditorStore.getState().scene?.id;
+    pendingMonitorMenuRef.current = setTimeout(() => {
+      pendingMonitorMenuRef.current = null;
+      // Пока ждали, схему могли сменить (скриптом, вкладкой) — меню той уже не к месту.
+      if (useEditorStore.getState().scene?.id !== sceneAt) return;
+      open();
+    }, Konva.dblClickWindow);
+  };
+
+  // Монитор: двойной клик входит внутрь составного компонента — та же механика уровня
+  // (activeGroupKey), что и в редакторе, чтобы меню можно было вызвать у вложенного.
+  const handleMonitorDblClick = (e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) => {
+    // Двойной клик — не два одиночных: отложенное меню первого клика не показываем.
+    cancelPendingMonitorMenu();
+
+    // Клик поглотила хит-область слоя интеракции — значит он адресован элементу с
+    // обработчиком события (на любой глубине), и тот уже отработал. Перехватывать
+    // такой двойной клик входом в группу нельзя: это сломало бы готовые схемы.
+    // Проверяем именно цель Konva: в readOnly только эти области и слушают.
+    if (e.target !== e.target.getStage()) return;
+
+    const el = containerAtPointer();
+    if (el) enterGroup(el.key);
+  };
+
+  /**
+   * Монитор: меню выбора, которое построил `onClick` вызовом `showMenu(items)` (движок
+   * исполняет скрипт, рисуем мы). Вид — от элемента со скриптом, как у его обычного меню.
+   *
+   * У элемента с `onDoubleClick` меню откладывается на окно двойного клика: иначе второй
+   * клик попал бы в пункт. Konva шлёт `click` и на втором клике — второй запрос в окне
+   * означает двойной клик, и меню не показываем вовсе (как в handleMonitorClick).
+   */
+  useEffect(() => {
+    if (!readOnly || archive) return;
+    setRuntimeMenuHandler(({ elementKey, point, items }) => {
+      if (pendingMonitorMenuRef.current) {
+        cancelPendingMonitorMenu();
+        return;
+      }
+      const el = useEditorStore.getState().elements.find(e => e.key === elementKey);
+      if (!el) return;
+      const open = () => setContextMenu({
+        x: point.x,
+        y: point.y,
+        items: buildChoiceMenu(el, items, { closeMenu, isLive: isRuntimeLive(), point }),
+        settings: readMonitorMenu(el.monitorMenu),
+      });
+      const dblClickMatters = el.events?.some(ev => ev.event_type === "onDoubleClick" && ev.handler?.code?.trim());
+      if (!dblClickMatters) { open(); return; }
+      const sceneAt = useEditorStore.getState().scene?.id;
+      pendingMonitorMenuRef.current = setTimeout(() => {
+        pendingMonitorMenuRef.current = null;
+        if (useEditorStore.getState().scene?.id !== sceneAt) return;
+        open();
+      }, Konva.dblClickWindow);
+    });
+    return () => setRuntimeMenuHandler(null);
+  }, [readOnly, archive, closeMenu, cancelPendingMonitorMenu]);
 
   const handleStageContextMenu = (e: Konva.KonvaEventObject<PointerEvent>) => {
     e.evt.preventDefault();
-    if (readOnly) return;
+    if (readOnly) { handleMonitorContextMenu(e); return; }
     const tg = e.target;
 
     if (tg === e.target.getStage() || tg.name() === "grid-bg") {
@@ -211,10 +461,20 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
       return;
     }
 
-    const elId = tg.attrs.id || tg.parent?.attrs.id || tg.parent?.parent?.attrs.id;
+    const hitId = tg.attrs.id || tg.parent?.attrs.id || tg.parent?.parent?.attrs.id;
+    if (!hitId) return;
+
+    // Через resolveClickTarget, как левый клик: иначе правым кликом можно было выделить
+    // вложенный элемент, чего левый не позволяет, и меню применялось бы к тому, что на
+    // холсте недоступно.
+    const elId = resolveClickTarget(hitId);
     if (!elId) return;
 
-    selectMultiple([elId]);
+    // Выделение сбрасываем только если кликнули ВНЕ него: иначе правый клик по одному
+    // из нескольких выделенных схлопывал набор, и пункты меню («Повернуть», «Копировать»,
+    // «Удалить») применялись к одному элементу вместо всех. Правило то же, что у левого
+    // нажатия (см. selectOnPress).
+    if (!useEditorStore.getState().selectedIds.includes(elId)) selectMultiple([elId]);
     const el = elementsMap[elId];
     if (!el) return;
 
@@ -256,10 +516,11 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
       <div style={{ width: "100%", height: "100%" }} onContextMenu={(e) => e.preventDefault()}>
         <Stage
           ref={stageRef}
-          // Stage — строго под размер видимой области (canvasRect), НЕ 5000×5000:
-          // Konva аллоцирует канвасы width×height×DPR на слой (+hit-канвас) — фикс. 5000×5000
-          // съедал сотни МБ и превышал лимит canvas в Safari. «Мир» 5000×5000 остаётся
-          // виртуальным — его даёт трансформ камеры (x/y/scale).
+          // Stage — строго под размер видимой области (canvasRect), а НЕ под размер
+          // листа: Konva аллоцирует канвасы width×height×DPR на слой (+хит-канвас),
+          // и Stage размером с лист A0 (21520×15240) съел бы сотни МБ и превысил
+          // лимит canvas в Safari. Лист остаётся виртуальным — его даёт трансформ
+          // камеры (x/y/scale) и прямоугольник в слое фона.
           width={canvasRect?.width ?? 800}
           height={canvasRect?.height ?? 600}
           scaleX={camera.zoom}
@@ -270,7 +531,10 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
           onMouseDown={handleStageMouseDown}
           onMouseMove={handleStageMouseMove}
           onMouseUp={handleStageMouseUp}
-          onClick={readOnly ? undefined : handleStagePlacementClick}
+          onClick={readOnly ? handleMonitorClick : handleStagePlacementClick}
+          onTap={readOnly ? handleMonitorClick : undefined}
+          onDblClick={readOnly ? handleMonitorDblClick : undefined}
+          onDblTap={readOnly ? handleMonitorDblClick : undefined}
           onContextMenu={handleStageContextMenu}
           onDragStart={handleStageDragStart}
           onDragMove={handleStageDragMove}
@@ -278,31 +542,52 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
           onMouseOver={readOnly ? undefined : handleStageMouseOver}
           onMouseLeave={clearHover}
         >
-          {/* Слой фона: перерисовывается только при смене темы. В общем слое
-              сетка размером 10000×10000 переписывалась заново на каждый кадр
+          {/* Слой фона: перерисовывается только при смене темы, размера листа и
+              шага сетки. В общем слое он переписывался бы заново на каждый кадр
               перетаскивания и на каждое движение рамки выделения.
-              listening=false — огромный прямоугольник уходит из hit-графа Konva;
-              клик по пустому месту приходит на сам Stage, и это уже учтено. */}
+              listening=false — большие прямоугольники уходят из hit-графа Konva;
+              клик по пустому месту приходит на сам Stage, и это уже учтено.
+
+              Лист — подсказка, а не запрет: за его край можно выйти, поэтому
+              «стол» рисуется с большим запасом вокруг. */}
           <Layer listening={false}>
             <Rect
-              key={`canvas-bg-${resolvedTheme}`}
-              name="canvas-bg"
-              x={-CANVAS_WIDTH / 2}
-              y={-CANVAS_HEIGHT / 2}
-              width={CANVAS_WIDTH * 2}
-              height={CANVAS_HEIGHT * 2}
-              fill={themeColors.canvasBg}
+              key={`desk-${resolvedTheme}`}
+              name="desk-bg"
+              x={-DESK_PAD}
+              y={-DESK_PAD}
+              width={sheet.w + DESK_PAD * 2}
+              height={sheet.h + DESK_PAD * 2}
+              fill={themeColors.deskBg}
             />
             <Rect
-              key={`grid-${resolvedTheme}`}
-              name="grid-bg"
-              x={-CANVAS_WIDTH / 2}
-              y={-CANVAS_HEIGHT / 2}
-              width={CANVAS_WIDTH * 2}
-              height={CANVAS_HEIGHT * 2}
-              fillPriority="pattern"
-              fillPatternImage={gridPattern as unknown as HTMLImageElement}
+              key={`sheet-${resolvedTheme}`}
+              name="sheet-bg"
+              x={0}
+              y={0}
+              width={sheet.w}
+              height={sheet.h}
+              fill={themeColors.canvasBg}
+              stroke={themeColors.sheetBorder}
+              strokeWidth={1}
+              // Толщина кромки — в экранных пикселях, БЕЗ деления на зум: иначе
+              // проп менялся бы на каждый тик колеса и слой фона перерисовывался
+              // бы вместе с ним. Тени у листа нет по той же причине (и потому что
+              // тень на прямоугольнике в 21520 единиц дорога сама по себе).
+              strokeScaleEnabled={false}
             />
+            {gridPattern && (
+              <Rect
+                key={`grid-${resolvedTheme}-${gridStep}`}
+                name="grid-bg"
+                x={0}
+                y={0}
+                width={sheet.w}
+                height={sheet.h}
+                fillPriority="pattern"
+                fillPatternImage={gridPattern as unknown as HTMLImageElement}
+              />
+            )}
           </Layer>
 
           {/* Слой содержимого: сами фигуры.
@@ -318,6 +603,24 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
               Живёт отдельно, чтобы движение мыши при протяжке рамки или
               перетаскивании перерисовывало только его, а не всю сцену. */}
           <Layer listening={!readOnly}>
+            {/* Рамка вида для монитора — только в редакторе: инженер видит, что именно
+                зафиксировал. Ширина — точно то, что монитор впишет во всю ширину экрана;
+                высота — сколько было видно у инженера (в мониторе по вертикали прокручивают). */}
+            {!readOnly && monitorView && (
+              <Rect
+                name="monitor-view-frame"
+                x={monitorView.x}
+                y={monitorView.y}
+                width={monitorView.w}
+                height={monitorView.h}
+                stroke={themeColors.selection}
+                strokeWidth={2}
+                dash={[10, 6]}
+                strokeScaleEnabled={false}
+                listening={false}
+              />
+            )}
+
             {/* «Нет данных» (монитор, docs/contract/TAG_CONTRACT_CHANGES.md B2/B4): пустой набор
                 вне монитора — движок рантайма там не запущен. */}
             <NoDataOverlay noDataElementKeys={noDataElementKeys} elements={elements} elementsMap={elementsMap} />
@@ -382,10 +685,11 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
               );
             })()}
 
-            {/* Smart-guides: линии привязки к соседям во время перетаскивания */}
+            {/* Smart-guides: линии привязки к соседям во время перетаскивания.
+                Тянутся за пределы листа — выравнивать можно и то, что за его краем. */}
             {guides.v !== null && (
               <Line
-                points={[guides.v, -CANVAS_HEIGHT / 2, guides.v, CANVAS_HEIGHT * 1.5]}
+                points={[guides.v, -sheet.h, guides.v, sheet.h * 2]}
                 stroke={themeColors.guide}
                 strokeWidth={1 / camera.zoom}
                 dash={[4, 4]}
@@ -394,7 +698,7 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
             )}
             {guides.h !== null && (
               <Line
-                points={[-CANVAS_WIDTH / 2, guides.h, CANVAS_WIDTH * 1.5, guides.h]}
+                points={[-sheet.w, guides.h, sheet.w * 2, guides.h]}
                 stroke={themeColors.guide}
                 strokeWidth={1 / camera.zoom}
                 dash={[4, 4]}
@@ -428,9 +732,12 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
 
           {/* Монитор: отдельный слой кликов по элементам с обработчиками событий
               (основной слой в readOnly не слушает — интерактив только здесь). */}
-          {readOnly && <MonitorInteractionLayer elements={elements} elementsMap={elementsMap} />}
+          {readOnly && !archive && <MonitorInteractionLayer elements={elements} elementsMap={elementsMap} />}
         </Stage>
       </div>
+
+      {/* Монитор: отказ в действии — у точки нажатия. */}
+      {readOnly && !archive && <RuntimeNoticeLayer />}
 
       {editingTextKey && (
         <TextEditorOverlay
@@ -442,9 +749,17 @@ export default function Canvas({ readOnly = false }: CanvasProps) {
 
       <ZoomControls
         zoom={camera.zoom}
-        onZoomBy={zoomBy}
+        onZoomStep={zoomStep}
         onFit={zoomFit}
+        onFitSheet={zoomFitSheet}
         onReset={() => setCamera(0, 0, 1)}
+        readOnly={readOnly}
+        viewLocked={!!monitorView}
+        // Замок фиксирует то, что видно СЕЙЧАС; повторное нажатие снимает фиксацию.
+        onToggleViewLock={() => {
+          if (monitorView) { setMonitorView(null); return; }
+          if (canvasRect) setMonitorView(monitorViewFromCamera(camera, canvasRect));
+        }}
       />
 
       <CanvasContextMenu menu={contextMenu} onClose={closeMenu} />

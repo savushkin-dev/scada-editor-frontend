@@ -5,11 +5,18 @@ import {protectedRoute, decodeJwtUsername} from "@/lib/protected";
 const BACKEND_URL = process.env.BACKEND_URL_EDITOR || 'http://localhost:8080';
 
 /**
- * Правка свойства компонента → `PUT /api/editor/properties/{id}`.
+ * ПЕРЕИМЕНОВАНИЕ свойства → `PUT /api/editor/properties/{id}`.
  *
- * Тело пробрасывается как есть, вместе с `based_on_version` (§8 контракта версий).
- * Перенос свойства на другой компонент бэкенд больше не выполняет: `component_id`
- * обязан совпадать с нынешним владельцем либо отсутствовать, иначе 400.
+ * Единственный оставшийся точечный запрос по свойствам: всё остальное (создание,
+ * правка полей, удаление, порядок) едет вместе со сценой в `ComponentCreateDto.properties`.
+ *
+ * Заведён он был ради рецептов: их значения ключевались ИМЕНЕМ строки, и перенести их на
+ * новое имя мог только он. С 09.09.2026 рецепт — процедура над ТЕГАМИ и о свойствах
+ * компонента не знает, так что этой причины больше нет. Роут оставлен: что ещё делает
+ * `PUT /api/editor/properties/{id}` на бэкенде, отсюда не видно.
+ *
+ * Перенос свойства на другой компонент бэкенд не выполняет: `component_id` обязан
+ * совпадать с нынешним владельцем либо отсутствовать, иначе 400.
  */
 export const PUT = protectedRoute(async (req: NextRequest, {token, params}) => {
   const propertyId = Number(params?.id);
@@ -51,3 +58,4 @@ export const PUT = protectedRoute(async (req: NextRequest, {token, params}) => {
 
   return NextResponse.json(updatedProperty);
 });
+

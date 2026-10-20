@@ -9,8 +9,10 @@ import {treeSearch} from "@/lib/treeSearch";
 import {NodeParamType, NodeType} from "@/types/channelsTypes";
 import {OpenCreateDeviveModal} from "@/components/ui/OpenCreateDeviceModal";
 import {OpenCreateProjectModal, OpenCreateSiteModal} from "@/components/ui/OpenCreateContainerModal";
+import {openGatewayExportModal} from "@/components/channels/OpenGatewayExportModal";
 import {confirmModal, promptModal} from "@/components/ui/ConfirmModal";
 import {toast} from "sonner";
+import {describeDenial, errorTextFromJson, isAccessDenial} from "@/lib/access/accessErrors";
 
 /**
  * Разбирает ответ и бросает ошибку с сообщением бэкенда при не-2xx.
@@ -29,6 +31,8 @@ const parseOk = async <T>(res: Response, fallback: string): Promise<T> => {
   }
 
   if (!res.ok) {
+    // Отказ по веткам каталога — `{error: "FORBIDDEN", reason: "PATH_NOT_ALLOWED"}`.
+    if (isAccessDenial(body)) throw new Error(describeDenial(body));
     const message =
       (body && typeof body === "object" && typeof (body as {message?: unknown}).message === "string"
         ? (body as {message: string}).message
@@ -75,6 +79,11 @@ interface DeviceStoreState {
   loadDeviceTemplateList: () => Promise<void>;
   addDevice: (node: {type: number; idNode: string; parentKey: string}) => Promise<void>;
   removeDevice: (Key: string) => Promise<void>;
+  /**
+   * Удаление импортированного проекта целиком. Отдельно от `removeDevice`: тот чистит
+   * массив по точному ключу, а у проекта тысячи потомков — они остались бы сиротами.
+   */
+  removeImportedProject: (projectKey: string) => Promise<void>;
   deleteOptionParam: (key: string) => Promise<void>;
   removeParam: (key: string) => Promise<void>;
   addParam: (param: { id: number; value: string; parentKey: string }) => Promise<void>;
@@ -169,7 +178,31 @@ export const useDeviceStore = create<DeviceStoreState>()(
             processedNodes.push({key: projectKey, title, parentKey});
           });
 
-          const uniqueParams = Array.from(new Map(allParams.map(p => [p.key, p])).values());
+          // Собственные параметры узла проекта fullHierarchy не отдаёт: его запрос — строго
+          // `id_node LIKE 'root.%'`, то есть только потомки, сам корень в выдачу не попадает
+          // (NodeRepository.findByIdNodeStartingWith). Добираем их по площадке через
+          // `hierarchy` (прямые дети, ~2 КБ на площадку) — иначе у проекта не видно ни
+          // «Источника импорта», ни любого другого его собственного параметра.
+          const sites = Array.from(
+            new Set(rootPath.map((p) => p.split('.')[0]).filter(Boolean)),
+          );
+          const siteParams: NodeParamType[] = [];
+          await Promise.all(sites.map(async (site) => {
+            try {
+              const res = await fetch(`/api/device/hierarchy?site=${encodeURIComponent(site)}`);
+              if (!res.ok) return;
+              const json: {params?: NodeParamType[]} = await res.json();
+              // Берём только выбранные проекты: у площадки в ответе есть и соседние,
+              // а их узлов в дереве нет.
+              siteParams.push(...(json.params ?? []).filter((p) => rootPath.includes(p.parentKey)));
+            } catch {
+              // Данные необязательные: дерево уже загружено, молча обходимся без них.
+            }
+          }));
+
+          const uniqueParams = Array.from(
+            new Map([...allParams, ...siteParams].map(p => [p.key, p])).values(),
+          );
 
           set({
             nodes: processedNodes,
@@ -308,6 +341,40 @@ export const useDeviceStore = create<DeviceStoreState>()(
         }));
         toast.success('Узел удалён');
       },
+      removeImportedProject: async (projectKey: string) => {
+        const [site, project] = projectKey.split('.');
+        if (!site || !project) return;
+
+        try {
+          const res = await fetch(
+            `/api/device/import/${encodeURIComponent(site)}/${encodeURIComponent(project)}`,
+            {method: 'DELETE'},
+          );
+          if (!res.ok) {
+            // 409 — проект создан не импортом, 404 — его уже нет. Текст бэкенда объясняет
+            // причину точнее любого нашего.
+            const body = await res.json().catch(() => null);
+            throw new Error(errorTextFromJson(res.status, body, `Не удалось удалить проект (${res.status})`));
+          }
+        } catch (err) {
+          console.error('Ошибка при удалении импортированного проекта:', err);
+          toast.error(errorMessage(err, 'Не удалось удалить проект'));
+          return;
+        }
+
+        // Локально массив не правим: под проектом тысячи узлов, и фильтр по точному ключу
+        // (как в removeDevice) оставил бы их в дереве без корня. Перечитываем то, что
+        // осталось, и убираем проект из загруженных — иначе следующая загрузка запросила бы
+        // уже несуществующий.
+        const rest = (get().loadedRootPath ?? []).filter(p => p !== projectKey);
+        set({loadedRootPath: rest, selectedDevice: null});
+        if (rest.length) {
+          await get().loadNodes(rest).catch(() => {});
+        } else {
+          set({nodes: [], params: []});
+        }
+        toast.success('Проект удалён');
+      },
       deleteOptionParam: async (key) => {
         try {
           const res = await fetch(`/api/device/param/${key}`, {
@@ -368,7 +435,7 @@ export const useDeviceStore = create<DeviceStoreState>()(
 
         if (!res.ok) {
           const error = await res.json().catch(() => ({}));
-          throw new Error(error.message || 'Ошибка сохранения параметров');
+          throw new Error(errorTextFromJson(res.status, error, 'Ошибка сохранения параметров'));
         }
 
         const updated = await res.json(); // ожидаем { value: [ { key, value }, ... ] }
@@ -422,6 +489,23 @@ export const useDeviceStore = create<DeviceStoreState>()(
         }
         if (action === 'edit') {
           await get().toggleEditing(get().selectedDevice ?? '');
+        }
+        if (action === 'export_gateway') {
+          if (!nodeKey) return;
+          openGatewayExportModal(nodeKey);
+        }
+        if (action === 'delete_import') {
+          if (!nodeKey) return;
+          const confirmed = await confirmModal({
+            title: `Удалить проект ${nodeKey} целиком?`,
+            description: 'Схемы, привязанные к его тегам, потеряют связь. Отмены нет: '
+              + '«Отменить» в журнале действий импорт и удаление не откатывает.',
+            confirmLabel: 'Удалить',
+            danger: true,
+          });
+          if (confirmed) {
+            await get().removeImportedProject(nodeKey);
+          }
         }
         get().setContextMenu(null);
       },

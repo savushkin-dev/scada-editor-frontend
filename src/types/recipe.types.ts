@@ -1,59 +1,171 @@
-export interface RecipeValueDto {
-  row_name: string;
-  value: string;
-}
+/**
+ * Процедурный рецепт — манифест тегов плюс упорядоченные шаги.
+ *
+ * Контракт: `docs/contract/2026-09-09-recipe-steps-contract.md` (сверено с кодом бэкенда
+ * на `origin/main`: `editor/dto/recipe/*`, `runtime/dto/Procedure*`, `runtime/stream/ProcedureEvent`).
+ *
+ * Рецепт больше не набор значений и ни к какому компоненту не привязан: он описывает
+ * ПРОЦЕДУРУ, которую рантайм проходит по шагам — на входе в шаг пишет теги, потом ждёт
+ * выполнения условия перехода. Прежние `component_id`/`type`/`values` и разовое применение
+ * (`POST /api/runtime/recipes/apply`) удалены с обеих сторон.
+ *
+ * Рецепт принадлежит ПРОЕКТУ (`docs/contract/2026-10-19-recipes-in-project-contract.md`):
+ * редактор правит черновик (`/api/editor/projects/{id}/recipes`), а мойка исполняет рецепт
+ * prod-выпуска — монитор берёт список из runtime (`/api/runtime/projects/{id}/recipes`).
+ */
 
-/** Вид набора значений. Список открытый — бэкенд примет любую строку. */
-export type RecipeSetType = "recipe" | "station_params" | string;
-
-export interface RecipeCreateDto {
+/**
+ * Тег манифеста: всё, что рецепт вправе записать.
+ *
+ * `name` — КОРОТКОЕ имя, которым на тег ссылаются шаги (`RecipeStepAction.tag`);
+ * `tag` — путь канала в проекте. Перепутать легко, а бэкенд ответит 400 со списком
+ * необъявленных имён.
+ */
+export interface RecipeTag {
   name: string;
-  /** Не прислан — бэкенд подставит "recipe". */
-  type?: RecipeSetType;
-  component_id: number;
-  values: RecipeValueDto[];
+  tag: string;
+  /**
+   * Ровно `"number" | "bool" | "string"` — по нему бэкенд проверяет `action[].value`
+   * при сохранении (`RecipeServiceImpl.requireTypeMatch`).
+   *
+   * Любое другое значение попадает в `default -> true` и проверку молча ОТКЛЮЧАЕТ, поэтому
+   * писать сюда «float» из базы каналов нельзя: 400 не будет, но и защиты не будет тоже.
+   * Пусто/не задано — тоже без проверки.
+   */
+  value_type?: RecipeValueType;
+  /** Человекочитаемое имя тега для интерфейса. */
+  description?: string;
 }
 
-export interface RecipeDto extends RecipeCreateDto {
-  id: number;
+/** Словарь типов, который понимает валидатор бэкенда. */
+export type RecipeValueType = "number" | "bool" | "string";
+
+export const RECIPE_VALUE_TYPES: {value: RecipeValueType; label: string}[] = [
+  {value: "number", label: "Число"},
+  {value: "bool", label: "Логический"},
+  {value: "string", label: "Строка"},
+];
+
+/** Запись действия шага: короткое имя тега из манифеста и значение в естественном типе. */
+export interface RecipeStepAction {
+  /** Ссылка на `RecipeTag.name`, НЕ путь тега. */
+  tag: string;
+  value: unknown;
 }
 
-/** Элемент значения в ответе /resolved — дополнен value_type/tag_id рантаймом. */
-export interface ResolvedRecipeValueDto {
-  row_name: string;
-  value: string;
-  value_type: string;
-  /** null — локальная строка (значение уходит в сессию, а не в ПЛК). */
-  tag_id: string | null;
+export interface RecipeStep {
+  name: string;
+  /** Выполняется при входе в шаг. Пустой массив допустим — шаг без записи (ждём подтверждения). */
+  action: RecipeStepAction[];
+  /**
+   * JS-условие перехода к следующему шагу. `null`/пусто — шаг завершается сразу после действия.
+   *
+   * Исполняет его РАНТАЙМ, фронт не разбирает и не запускает — для нас это текстовое поле.
+   * В области видимости скрипта: `elapsedMs`, `confirmed`, `readProjectTag(path)` (путь тега,
+   * не короткое имя).
+   */
+  condition_script: string | null;
+  /**
+   * Процедуру не останавливает — лишь помечает шаг «завис» событием `STALLED`,
+   * если условие не стало истинным за это время.
+   */
+  timeout_ms: number | null;
 }
 
-/** GET /api/editor/recipes/{id}/resolved — объект, не массив. */
-export interface ResolvedRecipeDto {
-  recipe_id: number;
-  component_id: number;
-  values: ResolvedRecipeValueDto[];
-  /** Имена строк, которых в таблице больше нет (удалили/переименовали в обход PUT /properties/{id}). */
-  unmatched_rows: string[];
+export interface Recipe {
+  /** Слаг из имени; выделяется один раз и при переименовании не меняется. */
+  id: string;
+  name: string;
+  tags: RecipeTag[];
+  steps: RecipeStep[];
+  /**
+   * Безопасное состояние на паузе: что рантайм пишет, когда мойка встаёт (руками оператора
+   * или сама по аварии). Клапаны сюда обычно не включают — пауза останавливает подачу и
+   * нагрев, но не сливает контур. При снятии паузы ТОЛЬКО эти теги возвращаются к значениям
+   * текущего шага, остальные шаг не переприменяет.
+   *
+   * Поле рецепта, а не шага. Теги — короткие имена из манифеста, как в `RecipeStepAction`.
+   *
+   * ВНИМАНИЕ к `PUT`: `null`/отсутствие означает «оставить прежнее», а пустой массив —
+   * «очистить». Форма, которая поля не знает, обязана его не слать, иначе молча сотрёт
+   * безопасное состояние (`RecipesPanel` именно так и делает).
+   */
+  pause_action?: RecipeStepAction[] | null;
+  /**
+   * Ключ истории версий рецепта (`/api/editor/recipes/{document_id}/versions`, как у сцен).
+   * Есть только в ответах редактора; рецепты prod-выпуска из runtime приходят без него.
+   */
+  document_id?: number;
 }
 
-/** GET /api/runtime/sessions/{sessionId}/snapshot?componentId= — текущие значения тегов (только теговые строки).
- *  value: null — сразу после рестарта рантайма значения ещё нет в памяти («нет данных», не 0/пусто). */
-export interface SnapshotTagValueDto {
-  tagId: string;
-  value: string | null;
+/** Тело POST/PUT — то же, что рецепт, без выданных сервером `id` и `document_id`. */
+export type RecipeCreatePayload = Omit<Recipe, "id" | "document_id">;
+
+/* ─────────────────────────── выполнение (runtime) ─────────────────────────── */
+
+/** Состояние выполняющейся процедуры. Ответ `start`/`status`/`confirm`/`jump`. */
+export interface ProcedureStatus {
+  recipeId: string;
+  stepIndex: number;
+  /** `null`, когда процедура уже `completed`. */
+  stepName: string | null;
+  elapsedMs: number;
+  confirmed: boolean;
+  completed: boolean;
+  stalled: boolean;
+  /**
+   * Процедура стоит: оборудование переведено в `pause_action` рецепта, шаг не продвигается.
+   * Пауза бывает не только ручной — рантайм ставит её сам, пока активна авария.
+   */
+  paused: boolean;
+  /**
+   * Почему стоит: «остановлена оператором» либо «авария: …». Показывать обязательно —
+   * авария может уйти сама (пауза выключила насос, и «нет расхода» больше не выполняется),
+   * и без причины оператор видел бы стоящую мойку без объяснения.
+   */
+  pauseReason: string | null;
 }
 
-/** POST /api/runtime/recipes/apply — результат записи набора значений. */
-export interface RecipeApplyResultDto {
-  recipeId: number;
-  total: number;
-  /** Сколько ушло в ПЛК. */
-  sent: number;
-  /** Сколько записано в сессию (локальные строки). */
-  localApplied: number;
-  failed: number;
-  /** Имена строк, которые не удалось применить. */
-  failedRows: string[];
-  /** Имена строк из набора, которых в таблице больше нет. */
-  unmatchedRows: string[];
+/**
+ * Вид события хода процедуры. На бэкенде это enum, но список держим ОТКРЫТЫМ:
+ * неизвестный код показываем как информационное сообщение, а не роняем панель.
+ */
+export type ProcedureEventKind =
+  | "STEP_STARTED"
+  | "STEP_COMPLETED"
+  | "WRITE_FAILED"
+  | "STALLED"
+  | "COMPLETED"
+  | "ABORTED"
+  | "PAUSED"
+  | "RESUMED"
+  | string;
+
+/** Событие из массива `procedures[]` кадра WS. */
+export interface ProcedureEvent {
+  recipeId: string;
+  /** `null` у `COMPLETED`/`ABORTED` (шага уже нет) и у `WRITE_FAILED`. */
+  stepIndex: number | null;
+  /** `null` у `COMPLETED`/`ABORTED`. */
+  stepName: string | null;
+  kind: ProcedureEventKind;
+  message: string | null;
+  /**
+   * Кто нажал: имя из `X-Username` и экран, с которого нажали. Событие уходит всем
+   * наблюдателям проекта, и без автора второй оператор видел бы, что шаг перескочил, но не
+   * видел бы, кто это сделал.
+   *
+   * У переходов, которые сделал сам рантайм (условие шага, тик), оба поля `null` — это
+   * норма, а не потеря данных.
+   */
+  by: string | null;
+  sessionId: string | null;
 }
+
+/** Событие завершает процедуру: текущего шага после него нет. */
+export const isTerminalProcedureEvent = (kind: ProcedureEventKind): boolean =>
+  kind === "COMPLETED" || kind === "ABORTED";
+
+/** Событие, о котором оператора надо предупредить отдельно. */
+export const isProcedureAlert = (kind: ProcedureEventKind): boolean =>
+  kind === "WRITE_FAILED" || kind === "STALLED" || kind === "PAUSED";

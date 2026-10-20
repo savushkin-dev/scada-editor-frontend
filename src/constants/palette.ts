@@ -26,6 +26,14 @@ export const paletteItems: PaletteItemType[] = [
     defaultProps: {name: "Arc", w: 120, h: 120, radius: 60, innerRadius: 0, angle: 90, rotate: 0, bg: "transparent", strokeColor: "#9ca3af", strokeWidth: 2},
   },
   {
+    id: 10 ** 5 + 6,
+    type: "curve",
+    name: "Кривая линия",
+    category: "Базовые",
+    // Арка 160×60: концы внизу, направляющие сверху — сразу видно, что фигура гнётся.
+    defaultProps: {name: "Curve", w: 160, h: 60, points: [0, 60, 40, 0, 120, 0, 160, 60], strokeColor: "#9ca3af", strokeWidth: 2},
+  },
+  {
     id: 10 ** 5 + 3,
     type: "polygon",
     name: "Многоугольник",
@@ -71,7 +79,7 @@ export const paletteItems: PaletteItemType[] = [
     type: "button",
     name: "Кнопка",
     category: "Управление",
-    defaultProps: {label: "Кнопка", w: 120, h: 40, color: "#3b82f6", textColor: "#ffffff", rx: 6, pressed: false, enabled: true},
+    defaultProps: {label: "Кнопка", text: "Кнопка", w: 120, h: 40, color: "#3b82f6", textColor: "#ffffff", fontSize: 16, rx: 6, pressed: false, enabled: true},
   },
   {
     id: 10 ** 5 + 11,
@@ -122,7 +130,7 @@ export const paletteItems: PaletteItemType[] = [
     type: "trend",
     name: "Тренды",
     category: "Визуализация",
-    defaultProps: {w: 300, h: 160, lineColor: "#3b82f6", backgroundColor: "#1e293b", strokeColor: "#475569", textColor: "#94a3b8", gridColor: "#1e3a5f", showGrid: true, showDots: false, filled: false, fillColor: "#1d4ed8", title: "Тренд", min: 0, max: 100},
+    defaultProps: {w: 320, h: 180, backgroundColor: "#1e293b", strokeColor: "#475569", textColor: "#94a3b8", gridColor: "#1e3a5f", showGrid: true, showDots: false, showLegend: true, title: "Тренд"},
   },
   {
     id: 10 ** 5 + 18,

@@ -3,14 +3,19 @@ import {NextResponse} from "next/server";
 /**
  * Общая часть прокси-роутов истории версий (`/api/editor/history/{docType}/{id}/…`).
  *
- * Путь на бэкенде — `/api/editor/{scenes|templates}/{id}/…`, то есть вид документа
+ * Путь на бэкенде — `/api/editor/{scenes|templates|automation|data|recipes}/{id}/…`, то есть вид документа
  * подставляется В URL. Поэтому `docType` проверяется белым списком, а не «как пришло»:
  * иначе любой сегмент из адресной строки уезжал бы в путь запроса к бэкенду.
  */
 
 export const EDITOR_BACKEND_URL = process.env.BACKEND_URL_EDITOR || "http://localhost:8080";
 
-const DOC_TYPES = ["scenes", "templates"] as const;
+// "projects" — выпуски проекта (docs/contract/2026-09-29-project-release-contract.md): список и
+// чтение идут тем же общим контроллером версий. Восстановление проекта бэкенд не поддерживает
+// (`restore/{n}` → 400), и интерфейс его не вызывает.
+// "recipes" — история рецепта проекта по его `document_id`
+// (docs/contract/2026-10-19-recipes-in-project-contract.md).
+const DOC_TYPES = ["scenes", "templates", "automation", "data", "projects", "recipes"] as const;
 export type VersionDocType = (typeof DOC_TYPES)[number];
 
 export const parseDocType = (raw: unknown): VersionDocType | null =>
@@ -27,6 +32,21 @@ export const parseId = (raw: unknown): number | null => {
 
 /** Ответ на кривые сегменты пути — 400 в том же формате `{message}`, что и остальные ошибки. */
 export const badPath = (message: string) => NextResponse.json({message}, {status: 400});
+
+/**
+ * Отдаёт ответ бэкенда как есть.
+ *
+ * Тела ошибок разбирает клиент: 400 `automation_invalid` несёт список нарушений
+ * (`errors[]` с task/field/message), 409 `version_mismatch` — номера версий. Подменять
+ * их своим `{message}` нельзя — форма не сможет подсветить поля.
+ */
+export const passThrough = async (response: Response) => {
+  const text = await response.text().catch(() => "");
+  return new NextResponse(text || null, {
+    status: response.status,
+    headers: {"Content-Type": response.headers.get("content-type") ?? "application/json"},
+  });
+};
 
 /**
  * Собирает query для списка версий.
