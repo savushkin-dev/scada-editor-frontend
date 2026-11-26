@@ -36,6 +36,8 @@ fits into `visibleCanvasArea(canvasRect)` (`ui/canvas/lib/visibleArea.ts`), not 
 by `data-canvas-root`; a collapsed panel (translated off the canvas) does not count. A new overlay
 over the canvas must carry the attribute too.
 
+После создания схемы редактор ставит центр листа в центр видимой части холста при 100%. Для существующих схем действует память камеры, а «Вписать лист» по-прежнему помещает на экран весь лист.
+
 ## Coordinates, states, and rendering
 
 - Child coordinates are **local to the parent container**. Absolute position = sum of rendered `x/y` up the `parentKey` chain (`getAbsoluteRenderedPosition`).
@@ -98,7 +100,15 @@ The backend stores each component's visual state as an **opaque JSON string** in
 
 When changing one side, keep the round-trip symmetric. There is a headless way to check it: transpile these two modules + `createUuid` with `npx tsc … --module commonjs` and exercise `buildComponentTree`→`transformElements` in a Node script (they have almost no runtime deps).
 
+Дескриптор примитива хранит `label` и визуальные поля выбранного состояния, включая `text` и подписи. У свойств внутри `composition` сериализуется содержимое без серверных ID. При разборе компонента свойства снова сохраняются как строки новых узлов.
+
 **Server ids of nested entities must round-trip.** Every nested entity that the backend numbers carries a `serverId` next to its local `id`: `ComponentState.serverId`, `ElementScript.serverId`, `TagBinding.serverId`, `ElementEventEntry.serverId`. The local `id` is a uuid used as a React key and must never be sent. `transformElements` / `parseBindings` / `parseEvents` set `serverId` only when the backend actually sent one, and `buildComponentTree` emits `id` only when `serverId` exists. A missing id on an *existing* entity reads as "deleted and recreated" — history is lost and merging reports a phantom conflict; renaming without an id is the case that actually breaks. Bindings additionally echo the pair the server assigned (`componentPropertyId` + `componentPropertyName` → `component_property_id` + `component_property_name`): the name is what lets version restore survive a property being deleted and recreated, so never strip it. Anything that **clones** elements (`cloneElementsWithOffset` for paste/duplicate, `addTemplate` for placing a palette template) must strip all of them via the `detachServer*Ids` helpers — the copy is a new entity, and carrying the original's ids tells the server the entity moved. One deliberate exclusion: **nothing server-assigned goes inside an opaque blob** — neither the binding JSON in `script` nor the baked `composition` descriptors in `states[].image`, because those blobs are rebuilt on every save and compared whole during merge.
+
+## Вкладки и выбор проекта
+
+Редактор рассчитывает, сколько вкладок помещается между боковыми панелями. Активная вкладка остаётся на полосе, «Рецепты» имеют приоритет среди остальных. Меню «Ещё N» показывает скрытые вкладки в сохранённом порядке. Пока схема не открыта, вкладка «Редактор» доступна и в проекте с закреплёнными схемами.
+
+Действия проекта раскрываются под строкой выбора. Удаление отделено от остальных команд. В списке схем подсветка булавки показывает закрепление.
 
 ## Properties travel with the scene
 
