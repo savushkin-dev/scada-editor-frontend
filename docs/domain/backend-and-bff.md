@@ -39,6 +39,7 @@ This is a **frontend + BFF**, not a standalone app. Everything under `src/app/ap
 - **Logout** (`/api/auth/logout`) sends `refresh_token` to the backend (errors swallowed) and clears
   both cookies. Already issued access tokens live until `exp`; only "end sessions" in the admin
   (`revoke-sessions`), a password change/reset or disabling the user kills them at once.
+- **Login 400**: пустое или некорректное тело JSON получает «Некорректный запрос» в BFF до обращения к gateway.
 - **Login 429**: 10 failed attempts per login in 15 minutes lock it until the window ends;
   `login/route.ts` turns `Retry-After` into «Слишком много неудачных попыток, повторите через N мин.».
   A login 401 always reads «Неверный логин или пароль» (the backend sends English «Invalid
@@ -47,7 +48,8 @@ This is a **frontend + BFF**, not a standalone app. Everything under `src/app/ap
   `POST /api/auth/ws-ticket` (30 s, single use, not valid for REST) and returns `{...session, ticket}`;
   `runtimeConnection` opens `wsPath?ticket=…`. A new session (and ticket) is created on every
   (re)connect. No ticket → 503, the monitor retries.
-- **Editor STOMP** still authenticates by the `access_token` cookie (same host as the gateway).
+- **Editor STOMP** uses the native WebSocket at `/ws/editor/websocket` and authenticates by the
+  `access_token` cookie (same host as the gateway).
   `beforeConnect` calls `POST /api/auth/refresh` (BFF, 204, cookies only) before every (re)connect,
   so a page idle longer than the token lifetime does not reconnect with an expired cookie.
 - Site keys after this frontend is deployed: `JWT_EXPIRATION_MS=28800000` (auth),
